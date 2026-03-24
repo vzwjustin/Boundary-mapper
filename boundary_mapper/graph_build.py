@@ -513,10 +513,14 @@ class GraphBuilder:
             # Check if this option has a case statement in any dispatch
             # function.  We look for:
             #   1. An enum_value symbol with dispatch=True (strongest)
-            #   2. Any enum_value symbol with a matching name (medium)
+            #   2. Any enum_value with exact name match (medium)
             #   3. Any kernel symbol reference to this name (fallback)
+            #
+            # IMPORTANT: use exact_name=True to avoid LIKE '%name%'
+            # substring matches returning wrong symbols (e.g.,
+            # querying "TQUIC_SEND" matching "TQUIC_SENDMSG").
             handler_syms = self.store.find_symbols(
-                name=opt_name, kind="enum_value",
+                name=opt_name, kind="enum_value", exact_name=True,
             )
             dispatch_entries = [
                 s for s in handler_syms
@@ -524,14 +528,24 @@ class GraphBuilder:
             ]
             has_set_handler = bool(dispatch_entries)
 
-            # Fallback: if no dispatch-tagged symbol, check for any
-            # kernel-side reference to this name.  This catches cases
-            # where the dispatch entry was extracted but not tagged
-            # (e.g., prefix mismatch), or where the option is handled
-            # via an ops table field rather than a switch case.
-            if not has_set_handler and not handler_syms:
+            # Fallback 1: exact match without dispatch flag — the
+            # symbol may exist but not tagged as dispatch (e.g.,
+            # defined in UAPI header, not in a case statement).
+            if not has_set_handler and handler_syms:
+                kernel_dispatch = self.store.find_symbols(
+                    name=opt_name, kind="enum_value",
+                    side="kernel", exact_name=True, limit=5,
+                )
+                has_set_handler = any(
+                    s.properties.get("dispatch") for s in kernel_dispatch)
+
+            # Fallback 2: any kernel-side reference to this name.
+            # Catches options handled via table lookup or function-
+            # pointer dispatch rather than a switch case.
+            if not has_set_handler:
                 kernel_refs = self.store.find_symbols(
-                    name=opt_name, side="kernel", limit=5,
+                    name=opt_name, side="kernel",
+                    exact_name=True, limit=5,
                 )
                 has_set_handler = bool(kernel_refs)
 

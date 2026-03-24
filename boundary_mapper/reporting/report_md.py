@@ -30,7 +30,9 @@ def generate_report(store: FactStore, output_path: Path,
     """Generate a full boundary mapping report in markdown."""
     stats = store.stats()
     surfaces = store.get_surfaces()
-    findings = store.get_findings(limit=1000)
+    # Fetch ALL findings — the old limit=1000 silently dropped HIGH
+    # severity findings when INFO findings filled the limit first.
+    findings = store.get_findings(limit=50000)
 
     lines = []
     _h = lines.append

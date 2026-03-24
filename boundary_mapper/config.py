@@ -226,12 +226,24 @@ def _auto_discover(repo_root: Path, module_name: str,
                                     os.path.join(dirpath, fname),
                                     str(repo_root))))
 
+    # Sockopt-related keywords: constants with these substrings are likely
+    # actual socket options rather than arbitrary numeric #defines.
+    _SOCKOPT_KEYWORDS = {"OPT", "SOL", "SO_", "SOCKOPT", "SETSOCKOPT",
+                         "GETSOCKOPT", "TCP_", "UDP_", "IP_", "IPV6_",
+                         "SCTP_", "DCCP_", "MPTCP_"}
+
     for hpath in header_files[:200]:  # cap for speed
         try:
             with open(hpath, "r", errors="replace") as f:
                 content = f.read()
         except OSError:
             continue
+
+        # Determine if this header is in a UAPI / shared directory
+        hrel = os.path.relpath(hpath, str(repo_root)).lower()
+        is_uapi = any(k in hrel for k in ("uapi", "shared", "public",
+                                           "include/net", "include/linux"))
+
         for m in define_re.finditer(content):
             name = m.group(1)
             val = m.group(2)
@@ -240,11 +252,24 @@ def _auto_discover(repo_root: Path, module_name: str,
             if len(parts) >= 2:
                 pfx = "_".join(parts[:2]) + "_"
                 prefix_counter[pfx] += 1
-            # Detect sockopt-like constants (prefix matches module, numeric val)
+
+            # Detect sockopt-like constants — stricter heuristic:
+            # Must match module prefix AND be a plausible sockopt:
+            #   - Located in a UAPI/shared header, OR
+            #   - Name contains a sockopt keyword (OPT, SOL, SO_, etc.), OR
+            #   - File also contains setsockopt/getsockopt references
             if name.startswith(prefix) and val.isdigit():
                 num = int(val)
                 if 0 < num < 1000:
-                    sockopt_map[str(num)] = name
+                    name_upper = name.upper()
+                    has_sockopt_keyword = any(kw in name_upper
+                                              for kw in _SOCKOPT_KEYWORDS)
+                    file_has_sockopt_ctx = ("setsockopt" in content or
+                                            "getsockopt" in content or
+                                            "sol_" in content.lower() or
+                                            "sockopt" in content.lower())
+                    if is_uapi or has_sockopt_keyword or file_has_sockopt_ctx:
+                        sockopt_map[str(num)] = name
 
     for cpath, crel in c_files[:200]:
         try:

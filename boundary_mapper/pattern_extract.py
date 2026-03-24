@@ -425,16 +425,49 @@ class PatternExtractor:
                 )],
             ))
 
+    # Go patterns that indicate sockopt usage via syscall/unix packages
+    _GO_SOCKOPT_PATTERNS = [
+        # syscall.SetsockoptInt(fd, level, CONST, val)
+        # unix.SetsockoptInt(fd, level, CONST, val)
+        re.compile(
+            r'(?:syscall|unix|golang\.org/x/sys/unix)\.'
+            r'(?:Setsockopt|Getsockopt)\w*\s*\([^)]*\b(\w+)\b',
+        ),
+        # Raw syscall: syscall.Syscall(SYS_SETSOCKOPT, ..., CONST, ...)
+        re.compile(
+            r'(?:syscall|unix)\.(?:Syscall|RawSyscall)\w*\s*\([^)]*'
+            r'(?:SYS_SETSOCKOPT|SYS_GETSOCKOPT)[^)]*\b(\w+)\b',
+        ),
+        # ConnMgr-style: setsockopt wrapper or method with option constant
+        re.compile(
+            r'(?:setsockopt|getsockopt|SetSockOpt|GetSockOpt|'
+            r'SetsockoptInt|GetsockoptInt)\s*\([^)]*\b(\w+)\b',
+        ),
+    ]
+
     def _extract_go_const_refs(self, content, sf, result):
-        """Extract Go constant references to profile commands/attrs."""
+        """Extract Go constant references to profile commands/attrs/options.
+
+        Scans for:
+        1. Constants matching command/attribute/option prefixes
+        2. Actual sockopt usage via syscall/unix Go packages
+        """
+        # Include option_prefixes so we detect sockopt constant references
         prefixes = (self.profile.get_command_prefixes() +
-                    self.profile.get_attribute_prefixes())
+                    self.profile.get_attribute_prefixes() +
+                    self.profile.get_option_prefixes())
+        lines = content.split("\n")
+        seen = set()  # avoid duplicate symbols at same location
+
         for prefix in prefixes:
             pat = re.compile(rf'\b({re.escape(prefix)}\w+)\b')
             for m in pat.finditer(content):
                 name = m.group(1)
                 line = content[:m.start()].count("\n") + 1
-                lines = content.split("\n")
+                key = (name, line)
+                if key in seen:
+                    continue
+                seen.add(key)
                 snippet = lines[line - 1].strip()[:100] if line <= len(lines) else ""
                 result.symbols.append(SymbolNode(
                     name=name,
@@ -450,6 +483,38 @@ class PatternExtractor:
                         method=ExtractionMethod.PATTERN_MATCH,
                         confidence=Confidence.MEDIUM,
                         note="Go constant reference",
+                    )],
+                ))
+
+        # Also detect sockopt usage via Go syscall/unix packages
+        # This catches cases where the constant is used directly in a
+        # setsockopt/getsockopt call even if it doesn't match a prefix
+        for sockopt_re in self._GO_SOCKOPT_PATTERNS:
+            for m in sockopt_re.finditer(content):
+                name = m.group(1)
+                # Skip Go keywords, numbers, and variables that start lowercase
+                if not name or name[0].islower() or name.isdigit():
+                    continue
+                line = content[:m.start()].count("\n") + 1
+                key = (name, line)
+                if key in seen:
+                    continue
+                seen.add(key)
+                snippet = lines[line - 1].strip()[:100] if line <= len(lines) else ""
+                result.symbols.append(SymbolNode(
+                    name=name,
+                    kind=SymbolKind.GO_CONST,
+                    side=Side.USERSPACE,
+                    file_path=sf.rel_path,
+                    line_start=line,
+                    evidence=[Evidence(
+                        file_path=sf.rel_path,
+                        line_start=line,
+                        symbol=name,
+                        snippet=snippet,
+                        method=ExtractionMethod.PATTERN_MATCH,
+                        confidence=Confidence.HIGH,
+                        note="Go sockopt usage (syscall/unix)",
                     )],
                 ))
 
@@ -579,8 +644,96 @@ class PatternExtractor:
 
     # ── Lint pattern extraction ──
 
+    # Map lint categories to guard checks.  Each entry is a list of
+    # (pattern, scope) tuples.  scope is "after" (check lines after match),
+    # "before" (check lines before), "around" (check both), or
+    # "match_line" (check the match line itself).
+    _LINT_GUARD_PATTERNS: dict[str, list[tuple[re.Pattern, str]]] = {
+        "unchecked_alloc": [
+            # if (!ptr)  /  if (ptr == NULL)  /  if (IS_ERR(ptr))
+            (re.compile(r'if\s*\(\s*!{var}\s*\)'), "after"),
+            (re.compile(r'if\s*\(\s*{var}\s*==\s*NULL\s*\)'), "after"),
+            (re.compile(r'if\s*\(\s*IS_ERR(?:_OR_NULL)?\s*\(\s*{var}\s*\)\s*\)'), "after"),
+            (re.compile(r'if\s*\(\s*unlikely\s*\(\s*!{var}\s*\)\s*\)'), "after"),
+            # ptr = NULL or ptr = ERR_PTR (reassignment, not original alloc)
+            (re.compile(r'{var}\s*=\s*(?:NULL|ERR_PTR)'), "after"),
+        ],
+        "unsafe_copy": [
+            # if (copy_from_user(...)) — call used as condition
+            (re.compile(r'if\s*\(\s*copy_(?:from|to)_user\b'), "match_line"),
+            # ret = copy_from_user(...) — return value captured
+            (re.compile(r'\w+\s*=\s*copy_(?:from|to)_user\b'), "match_line"),
+        ],
+        "use_after_free": [
+            # ptr = NULL after kfree
+            (re.compile(r'{var}\s*=\s*NULL\s*;'), "after"),
+        ],
+        "deadlock": [
+            # spin_unlock / mutex_unlock between the two lock calls
+            (re.compile(r'(?:spin_unlock|mutex_unlock|read_unlock|write_unlock)'), "around"),
+        ],
+        "integer_overflow": [
+            # Size check before kmalloc: if (len > MAX) / clamp / min
+            (re.compile(r'if\s*\(\s*\w*len\w*\s*[>!]'), "before"),
+            (re.compile(r'min\s*\('), "before"),
+            (re.compile(r'clamp\s*\('), "before"),
+            (re.compile(r'check_mul_overflow'), "before"),
+        ],
+    }
+
+    def _has_guard_in_context(self, content: str, match, category: str,
+                               lines: list[str], match_line: int) -> bool:
+        """Check if nearby lines contain a standard guard for this finding."""
+        guards = self._LINT_GUARD_PATTERNS.get(category)
+        if not guards:
+            return False
+
+        # Extract variable name from the match (group 1 if present)
+        try:
+            var_name = match.group(1)
+        except (IndexError, AttributeError):
+            var_name = None
+
+        # Pre-compute context regions
+        before_start = max(0, match_line - 3)
+        after_end = min(match_line + 4, len(lines))
+        before_text = "\n".join(lines[before_start:match_line])
+        match_text = lines[match_line] if match_line < len(lines) else ""
+        after_text = "\n".join(lines[match_line + 1:after_end])
+
+        for guard_re, scope in guards:
+            pattern_str = guard_re.pattern
+            if var_name and "{var}" in pattern_str:
+                pattern_str = pattern_str.replace("{var}", re.escape(var_name))
+            elif "{var}" in pattern_str:
+                continue  # need a var name but don't have one
+
+            # Select the text to search based on scope
+            if scope == "after":
+                search_text = after_text
+            elif scope == "before":
+                search_text = before_text
+            elif scope == "match_line":
+                search_text = match_text
+            else:  # "around"
+                search_text = before_text + "\n" + after_text
+
+            try:
+                if re.search(pattern_str, search_text):
+                    return True
+            except re.error:
+                continue
+
+        return False
+
     def _extract_lint(self, content: str, sf, result, lang, ext: str):
-        """Run lint patterns against file content and collect hits."""
+        """Run lint patterns against file content and collect hits.
+
+        For each match, checks the surrounding 1-3 lines for standard
+        guards (NULL checks, error checks, unlocks, size validation).
+        Matches with proper guards are suppressed to reduce false positives.
+        """
+        lines = content.split("\n")
         for lp in lang.lint_patterns:
             if lp.only_in and ext != lp.only_in:
                 continue
@@ -594,6 +747,12 @@ class PatternExtractor:
 
             for m in pat.finditer(content):
                 line = content[:m.start()].count("\n") + 1
+
+                # Check if a standard guard exists in the surrounding context
+                if self._has_guard_in_context(content, m, lp.category,
+                                               lines, line - 1):
+                    continue  # guarded — not a true positive
+
                 snippet = m.group(0)[:120].strip()
                 result.lint_hits.append({
                     "name": lp.name,

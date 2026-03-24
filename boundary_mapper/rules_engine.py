@@ -52,18 +52,20 @@ class DeadSurfaceRule(Rule):
             if not surf.kernel_entrypoint and not surf.handler:
                 # Determine severity and recommendation using profile
                 opt_name = surf.shared_contract or surf.name.split(":")[-1]
-                severity = FindingSeverity.HIGH
-                category = "dead_surface"
-                recommendation = "Implement handler or remove dead declaration"
 
+                # Suppress entirely if the profile knows this is intentional.
+                # Emitting INFO/LOW findings for known-future or known-diagnostic
+                # surfaces just creates noise — they are not actionable.
                 if hasattr(profile, "is_future_reserved") and profile.is_future_reserved(opt_name):
-                    severity = FindingSeverity.LOW
-                    category = "future_reserved_surface"
-                    recommendation = "keep_as_future_reserved"
-                elif hasattr(profile, "is_diagnostic") and profile.is_diagnostic(opt_name):
-                    severity = FindingSeverity.LOW
-                    category = "diagnostic_surface"
-                    recommendation = "implement_with_feature"
+                    continue
+                if hasattr(profile, "is_diagnostic") and profile.is_diagnostic(opt_name):
+                    continue
+
+                # Heuristic: names ending with common "not yet" suffixes are
+                # likely reserved slots, not bugs.
+                if opt_name.endswith(("_RESERVED", "_FUTURE", "_PLACEHOLDER",
+                                      "_UNSPEC", "_PAD", "_MAX", "__MAX")):
+                    continue
 
                 findings.append(Finding(
                     title=f"Dead surface: {surf.name}",
@@ -71,29 +73,24 @@ class DeadSurfaceRule(Rule):
                         f"Boundary surface '{surf.name}' ({surf.boundary_type.value}) "
                         f"is declared but has no kernel handler."
                     ),
-                    severity=severity,
-                    category=category,
+                    severity=FindingSeverity.HIGH,
+                    category="dead_surface",
                     status=WiringStatus.DEAD,
                     evidence=surf.evidence,
-                    recommendation=recommendation,
+                    recommendation="Implement handler or remove dead declaration",
                 ))
             elif not surf.userspace_producer:
                 # Kernel-only surface — check if intentional
                 opt_name = surf.shared_contract or surf.name.split(":")[-1]
                 family_name = surf.name.split(":")[0] if ":" in surf.name else ""
 
-                severity = FindingSeverity.MEDIUM
-                category = "missing_producer"
-                recommendation = "Verify userspace code exercises this path"
-
+                # Suppress entirely for known intentional kernel-only surfaces.
                 if hasattr(profile, "is_kernel_only_genl") and profile.is_kernel_only_genl(family_name):
-                    severity = FindingSeverity.INFO
-                    category = "intentional_kernel_only"
-                    recommendation = "leave_kernel_only"
-                elif hasattr(profile, "is_future_reserved") and profile.is_future_reserved(opt_name):
-                    severity = FindingSeverity.INFO
-                    category = "future_reserved_surface"
-                    recommendation = "keep_as_future_reserved"
+                    continue
+                if hasattr(profile, "is_future_reserved") and profile.is_future_reserved(opt_name):
+                    continue
+                if hasattr(profile, "is_diagnostic") and profile.is_diagnostic(opt_name):
+                    continue
 
                 findings.append(Finding(
                     title=f"No userspace producer: {surf.name}",
@@ -101,11 +98,11 @@ class DeadSurfaceRule(Rule):
                         f"Boundary surface '{surf.name}' has a kernel handler "
                         f"({surf.handler}) but no detected userspace producer."
                     ),
-                    severity=severity,
-                    category=category,
+                    severity=FindingSeverity.MEDIUM,
+                    category="missing_producer",
                     status=WiringStatus.PARTIALLY_WIRED,
                     evidence=surf.evidence,
-                    recommendation=recommendation,
+                    recommendation="Verify userspace code exercises this path",
                 ))
         return findings
 
@@ -116,32 +113,65 @@ class MissingHandlerRule(Rule):
     description = "Userspace sends commands that no kernel handler processes"
     category = "missing_wiring"
 
+    # Minimum command stem length to avoid matching everything.
+    # Short stems like "get", "set", "new" produce massive false positives
+    # via substring matching against kernel function names.
+    _MIN_CMD_STEM_LEN = 4
+
     def evaluate(self, store: FactStore, profile) -> list[Finding]:
+        import re as _re
+
         findings = []
         us_syms = store.find_symbols(side="userspace", limit=500)
         kernel_funcs = {s.name for s in store.find_symbols(
             kind="function_def", side="kernel", limit=5000)}
 
+        # Also check dispatch entries — if the command has a case statement
+        # in kernel dispatch, it has a handler even if we can't name-match it.
+        kernel_dispatch = {s.name for s in store.find_symbols(
+            kind="enum_value", side="kernel", limit=5000)
+            if s.properties.get("dispatch")}
+
         for sym in us_syms:
-            if sym.kind == SymbolKind.GO_CONST:
-                for prefix in profile.get_command_prefixes():
-                    if sym.name.startswith(prefix):
-                        cmd_lower = sym.name.replace(prefix, "").lower()
-                        found = any(cmd_lower in fn.lower() for fn in kernel_funcs)
-                        if not found:
-                            findings.append(Finding(
-                                title=f"Userspace command without handler: {sym.name}",
-                                description=(
-                                    f"Userspace references {sym.name} in "
-                                    f"{sym.file_path}:{sym.line_start} but no "
-                                    f"kernel handler containing '{cmd_lower}' found."
-                                ),
-                                severity=FindingSeverity.MEDIUM,
-                                category="missing_handler",
-                                status=WiringStatus.PARTIALLY_WIRED,
-                                evidence=sym.evidence,
-                                recommendation="implement_kernel_handler",
-                            ))
+            if sym.kind != SymbolKind.GO_CONST:
+                continue
+            for prefix in profile.get_command_prefixes():
+                if not sym.name.startswith(prefix):
+                    continue
+
+                # Already dispatched in kernel → has a handler
+                if sym.name in kernel_dispatch:
+                    continue
+
+                cmd_stem = sym.name[len(prefix):].lower()
+
+                # Skip very short stems — "get", "set", "new", "del" etc.
+                # match far too many unrelated kernel functions.
+                if len(cmd_stem) < self._MIN_CMD_STEM_LEN:
+                    continue
+
+                # Use word-boundary matching instead of substring.
+                # Match "connect" in "mymod_nl_cmd_connect" but NOT in
+                # "mymod_reconnect_timer" or "disconnect_all".
+                stem_re = _re.compile(
+                    r'(?:^|_)' + _re.escape(cmd_stem) + r'(?:$|_)',
+                    _re.IGNORECASE,
+                )
+                found = any(stem_re.search(fn) for fn in kernel_funcs)
+                if not found:
+                    findings.append(Finding(
+                        title=f"Userspace command without handler: {sym.name}",
+                        description=(
+                            f"Userspace references {sym.name} in "
+                            f"{sym.file_path}:{sym.line_start} but no "
+                            f"kernel handler matching '{cmd_stem}' found."
+                        ),
+                        severity=FindingSeverity.MEDIUM,
+                        category="missing_handler",
+                        status=WiringStatus.PARTIALLY_WIRED,
+                        evidence=sym.evidence,
+                        recommendation="implement_kernel_handler",
+                    ))
         return findings
 
 
@@ -187,24 +217,19 @@ class ContractDriftRule(Rule):
             if kernel_refs:
                 continue
 
-            # Classify the drift
-            severity = FindingSeverity.LOW
-            category = "unused_uapi"
-            recommendation = "remove_or_deprecate_uapi"
-
+            # Suppress entirely for known-safe categories — emitting INFO
+            # findings for these just creates noise.
             if has_reserved_check and profile.is_reserved_attr(sym.name):
-                severity = FindingSeverity.INFO
-                category = "reserved_contract"
-                recommendation = "ignore_for_now_low_value"
-            elif has_future_check and profile.is_future_reserved(sym.name):
-                severity = FindingSeverity.INFO
-                category = "future_surface"
-                recommendation = "keep_as_future_reserved"
-            elif sym.name.endswith("_STATS") or sym.name.endswith("_INFO"):
-                # Heuristic: stats/info constants often come with features
-                severity = FindingSeverity.INFO
-                category = "future_surface"
-                recommendation = "implement_with_feature"
+                continue
+            if has_future_check and profile.is_future_reserved(sym.name):
+                continue
+
+            # Heuristic suppression for common "not a bug" suffixes.
+            # These are almost always intentional reserved/sentinel values.
+            if sym.name.endswith(("_STATS", "_INFO", "_RESERVED", "_FUTURE",
+                                  "_UNSPEC", "_PAD", "_MAX", "__MAX",
+                                  "_PLACEHOLDER", "_LAST", "_NUM")):
+                continue
 
             findings.append(Finding(
                 title=f"UAPI constant unused in kernel: {sym.name}",
@@ -212,11 +237,11 @@ class ContractDriftRule(Rule):
                     f"{sym.name} defined in {sym.file_path}:{sym.line_start} "
                     f"but not found in kernel dispatch or usage."
                 ),
-                severity=severity,
-                category=category,
+                severity=FindingSeverity.LOW,
+                category="unused_uapi",
                 status=WiringStatus.DECLARED,
                 evidence=sym.evidence,
-                recommendation=recommendation,
+                recommendation="remove_or_deprecate_uapi",
             ))
 
         return findings
@@ -253,19 +278,12 @@ class AttributeSymmetryRule(Rule):
                 if sym.name in attr_reads or sym.name in attr_writes:
                     continue
 
-                # Classify the unused attribute
-                severity = FindingSeverity.LOW
-                category = "unused_attribute"
-                recommendation = "verify_runtime"
-
+                # Suppress entirely for known-safe sentinel/reserved suffixes.
                 if has_reserved_check and profile.is_reserved_attr(sym.name):
-                    severity = FindingSeverity.INFO
-                    category = "reserved_contract"
-                    recommendation = "ignore_for_now_low_value"
-                elif sym.name.endswith("_UNSPEC") or sym.name.endswith("_PAD"):
-                    severity = FindingSeverity.INFO
-                    category = "reserved_contract"
-                    recommendation = "ignore_for_now_low_value"
+                    continue
+                if sym.name.endswith(("_UNSPEC", "_PAD", "_MAX", "__MAX",
+                                      "_LAST", "_NUM", "_RESERVED")):
+                    continue
 
                 findings.append(Finding(
                     title=f"UAPI attribute never accessed: {sym.name}",
@@ -273,11 +291,11 @@ class AttributeSymmetryRule(Rule):
                         f"{sym.name} defined in UAPI but never "
                         f"nla_get/nla_put'd in kernel code."
                     ),
-                    severity=severity,
-                    category=category,
+                    severity=FindingSeverity.LOW,
+                    category="unused_attribute",
                     status=WiringStatus.DECLARED,
                     evidence=sym.evidence,
-                    recommendation=recommendation,
+                    recommendation="verify_runtime",
                 ))
 
         return findings
@@ -312,33 +330,39 @@ class SockoptCompleteness(Rule):
             if opt_name in set_cases:
                 continue
 
-            # Use profile classification if available
-            bucket = "dead_uapi"
-            recommendation = "add_kernel_dispatch"
-            importance = 5
-            severity = FindingSeverity.HIGH
-
+            # Suppress entirely for known-safe categories.
+            # Emitting LOW/INFO findings for intentionally future-reserved
+            # or diagnostic-only options creates massive noise.
             if has_classify:
                 bucket = profile.classify_sockopt_bucket(
                     opt_name, has_dispatch=False, has_userspace=False)
+                if bucket in ("likely_future", "diagnostic_only"):
+                    continue
+            else:
+                bucket = "dead_uapi"
+
+            # Heuristic suppression for common "not a bug" suffixes.
+            if opt_name.endswith(("_RESERVED", "_FUTURE", "_PLACEHOLDER",
+                                  "_UNSPEC", "_PAD", "_MAX", "__MAX")):
+                continue
+
+            recommendation = "add_kernel_dispatch"
+            importance = 5
+            severity = FindingSeverity.MEDIUM
+
             if has_action:
                 recommendation = profile.get_recommended_action(
                     opt_name, has_dispatch=False, has_userspace=False)
             if has_importance:
                 importance = profile.get_importance_score(opt_name)
 
-            # Adjust severity based on bucket
-            if bucket == "likely_future":
+            # Adjust severity based on importance
+            if importance >= 7:
+                severity = FindingSeverity.HIGH
+            elif importance >= 4:
+                severity = FindingSeverity.MEDIUM
+            else:
                 severity = FindingSeverity.LOW
-            elif bucket == "diagnostic_only":
-                severity = FindingSeverity.LOW
-            elif bucket == "dead_uapi":
-                if importance >= 7:
-                    severity = FindingSeverity.HIGH
-                elif importance >= 4:
-                    severity = FindingSeverity.MEDIUM
-                else:
-                    severity = FindingSeverity.LOW
 
             family = ""
             if hasattr(profile, "get_sockopt_family"):
@@ -348,8 +372,6 @@ class SockoptCompleteness(Rule):
                 f"Socket option {opt_name} (={opt_num}) defined in UAPI "
                 f"but no case statement found in any sockopt handler.",
             ]
-            if bucket != "dead_uapi":
-                desc_parts.append(f"Classification: {bucket}.")
             if family:
                 desc_parts.append(f"Family: {family}.")
             desc_parts.append(f"Importance: {importance}/10.")
@@ -379,11 +401,44 @@ class OrphanHandlerRule(Rule):
     description = "Handler function exists but not registered in ops table"
     category = "dead_code"
 
+    # Suffixes that indicate helper/internal functions, not actual
+    # boundary entry points.  These should not be flagged as orphan.
+    _HELPER_SUFFIXES = (
+        "_init", "_exit", "_cleanup", "_setup", "_free", "_alloc",
+        "_destroy", "_release", "_open", "_close", "_probe", "_remove",
+        "_create", "_delete", "_lock", "_unlock", "_work", "_timer",
+        "_cb", "_callback", "_notify", "_event",
+    )
+
     def evaluate(self, store: FactStore, profile) -> list[Finding]:
+        import re as _re
+
         findings = []
-        handler_patterns = []
+
+        # Extract the kernel name patterns from handler_patterns.
+        # handler_patterns look like r"(int\s+\w+_setsockopt\s*\()" —
+        # we want to extract the function name part: "\w+_setsockopt".
+        name_patterns = []
         for bp in profile.get_boundary_patterns():
-            handler_patterns.extend(bp.handler_patterns)
+            for pat in bp.handler_patterns:
+                # Extract just the function name regex from the full
+                # signature pattern.  Strip return type, parens, etc.
+                # Pattern typically: (return_type\s+NAME_PATTERN\s*\()
+                cleaned = pat
+                # Remove capture groups
+                cleaned = cleaned.replace("(", "").replace(")", "")
+                # Remove return type prefix (e.g., "int\s+", "unsigned\s+int\s+")
+                cleaned = _re.sub(
+                    r'^(?:unsigned\s+)?(?:int|void|long|bool|ssize_t)'
+                    r'\\s[+*]', '', cleaned)
+                # Remove trailing \s*\( and whitespace anchors
+                cleaned = _re.sub(r'\\s[*+]?\\?\(?$', '', cleaned)
+                cleaned = cleaned.strip()
+                if cleaned and len(cleaned) > 3:
+                    name_patterns.append(cleaned)
+
+        if not name_patterns:
+            return findings
 
         all_funcs = store.find_symbols(kind="function_def", side="kernel",
                                        limit=5000)
@@ -392,30 +447,43 @@ class OrphanHandlerRule(Rule):
         for edge in all_edges:
             registered_handlers.add(edge.properties.get("handler", ""))
 
-        import re
+        # Also treat functions referenced in call graph as "used"
+        call_edges = store.get_edges(kind="calls", limit=50000)
+        called_funcs = {e.properties.get("callee", "") for e in call_edges}
+
         for func in all_funcs:
-            for pat in handler_patterns:
+            # Skip static functions — they may be wired via pointer
+            if func.properties.get("storage_class") == "static":
+                continue
+            # Skip helper/internal function suffixes
+            if any(func.name.endswith(s) for s in self._HELPER_SUFFIXES):
+                continue
+            # Skip already registered
+            if func.name in registered_handlers:
+                continue
+            # Skip functions that are called by other functions
+            if func.name in called_funcs:
+                continue
+
+            for pat in name_patterns:
                 try:
-                    cleaned = pat.replace(r"\(", "").replace("(", "")
-                    cleaned = cleaned.replace(r"\)", "").replace(")", "")
-                    if re.search(cleaned, func.name):
-                        if func.name not in registered_handlers:
-                            findings.append(Finding(
-                                title=f"Orphan handler: {func.name}",
-                                description=(
-                                    f"Function {func.name} in "
-                                    f"{func.file_path}:{func.line_start} "
-                                    f"matches handler pattern but is not "
-                                    f"registered in any ops table."
-                                ),
-                                severity=FindingSeverity.MEDIUM,
-                                category="orphan_handler",
-                                status=WiringStatus.DEFINED,
-                                evidence=func.evidence,
-                                recommendation="investigate_manually",
-                            ))
+                    if _re.fullmatch(pat, func.name):
+                        findings.append(Finding(
+                            title=f"Orphan handler: {func.name}",
+                            description=(
+                                f"Function {func.name} in "
+                                f"{func.file_path}:{func.line_start} "
+                                f"matches handler pattern but is not "
+                                f"registered in any ops table."
+                            ),
+                            severity=FindingSeverity.MEDIUM,
+                            category="orphan_handler",
+                            status=WiringStatus.DEFINED,
+                            evidence=func.evidence,
+                            recommendation="investigate_manually",
+                        ))
                         break
-                except re.error:
+                except _re.error:
                     continue
 
         return findings

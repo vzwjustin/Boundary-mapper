@@ -511,7 +511,10 @@ class GraphBuilder:
 
         for opt_num, opt_name in self.profile.SOCKOPT_MAP.items():
             # Check if this option has a case statement in any dispatch
-            # function (stronger than just finding the enum_value symbol)
+            # function.  We look for:
+            #   1. An enum_value symbol with dispatch=True (strongest)
+            #   2. Any enum_value symbol with a matching name (medium)
+            #   3. Any kernel symbol reference to this name (fallback)
             handler_syms = self.store.find_symbols(
                 name=opt_name, kind="enum_value",
             )
@@ -519,7 +522,18 @@ class GraphBuilder:
                 s for s in handler_syms
                 if s.properties.get("dispatch")
             ]
-            has_set_handler = bool(handler_syms) or bool(dispatch_entries)
+            has_set_handler = bool(dispatch_entries)
+
+            # Fallback: if no dispatch-tagged symbol, check for any
+            # kernel-side reference to this name.  This catches cases
+            # where the dispatch entry was extracted but not tagged
+            # (e.g., prefix mismatch), or where the option is handled
+            # via an ops table field rather than a switch case.
+            if not has_set_handler and not handler_syms:
+                kernel_refs = self.store.find_symbols(
+                    name=opt_name, side="kernel", limit=5,
+                )
+                has_set_handler = bool(kernel_refs)
 
             # Check for userspace producer
             us_producer = self._find_userspace_producer(

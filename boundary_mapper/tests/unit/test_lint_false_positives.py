@@ -463,5 +463,237 @@ def _extract_lint_hits(src, ext):
     return result.lint_hits
 
 
+# ── UAF: freed variable vs different variable ───────────────────
+
+
+class TestUAFVariableTracking(unittest.TestCase):
+    """UAF detector should track which variable was freed."""
+
+    def test_different_variable_after_kfree_suppressed(self):
+        """kfree(path) then tquic_dbg(path->path_id) — path_id is a
+        different token from path, but even if the regex captures it,
+        the debug macro should suppress."""
+        src = """\
+void mymod_free_path(struct path *path) {
+    int id = path->path_id;
+    kfree(path);
+    tquic_dbg("freed path %d", id);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        uaf = [h for h in hits if h["category"] == "use_after_free"]
+        self.assertEqual(len(uaf), 0,
+                         "Debug print after kfree should be suppressed")
+
+    def test_different_var_name_not_flagged(self):
+        """kfree(path) then use of path_timer — different variable."""
+        src = """\
+void mymod_cleanup(struct conn *conn) {
+    struct path *path = conn->path;
+    kfree(path);
+    conn->path_timer = 0;
+    conn->path_count--;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        uaf = [h for h in hits if h["category"] == "use_after_free"]
+        self.assertEqual(len(uaf), 0,
+                         "path_timer/path_count are not 'path' — not UAF")
+
+    def test_actual_deref_after_kfree_flagged(self):
+        """kfree(ptr) then ptr->field — genuine UAF."""
+        src = """\
+void mymod_bad(struct foo *ptr) {
+    kfree(ptr);
+    ptr->count = 0;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        uaf = [h for h in hits if h["category"] == "use_after_free"]
+        self.assertGreater(len(uaf), 0,
+                           "Actual dereference after kfree must be flagged")
+
+    def test_return_after_kfree_suppressed(self):
+        """kfree(ptr); return; — no use of freed pointer."""
+        src = """\
+void mymod_release(struct foo *ptr) {
+    kfree(ptr);
+    return;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        uaf = [h for h in hits if h["category"] == "use_after_free"]
+        self.assertEqual(len(uaf), 0,
+                         "return after kfree is not UAF")
+
+
+# ── kmalloc bounds: tracing through assignments ─────────────────
+
+
+class TestKmallocBoundsTracing(unittest.TestCase):
+    """kmalloc size checker should trace through assignments."""
+
+    def test_comparison_bound_1500_chars_back(self):
+        """Bounds check further back than 500 chars should be found."""
+        # Create source with > 500 chars between check and kmalloc
+        padding = "    // padding line\n" * 40  # ~800 chars
+        src = f"""\
+int mymod_alloc(int ct_len) {{
+    if (ct_len > 256)
+        return -EINVAL;
+{padding}    buf = kmalloc(ct_len, GFP_KERNEL);
+    return 0;
+}}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertEqual(len(size_hits), 0,
+                         "Bounds check 800+ chars back should suppress")
+
+    def test_sizeof_assignment_suppressed(self):
+        """var = sizeof(struct foo); kmalloc(var) should be safe."""
+        src = """\
+void mymod_init(void) {
+    size_t alloc_len = sizeof(struct mymod_ctx);
+    buf = kmalloc(alloc_len, GFP_KERNEL);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertEqual(len(size_hits), 0,
+                         "sizeof assignment should suppress")
+
+    def test_min_assignment_suppressed(self):
+        """var = min(user_len, MAX); kmalloc(var) should be safe."""
+        src = """\
+void mymod_recv(int user_len) {
+    size_t alloc_len = min(user_len, 4096);
+    buf = kmalloc(alloc_len, GFP_KERNEL);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertEqual(len(size_hits), 0,
+                         "min() assignment should suppress")
+
+    def test_numeric_comparison_suppressed(self):
+        """if (retry_len > 1440) return; kmalloc(retry_len) is safe."""
+        src = """\
+int mymod_retry(int retry_len) {
+    if (retry_len > 1440)
+        return -EINVAL;
+    buf = kmalloc(retry_len, GFP_KERNEL);
+    return 0;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertEqual(len(size_hits), 0,
+                         "Numeric comparison should suppress")
+
+
+# ── kmalloc severity: network input escalation ──────────────────
+
+
+class TestKmallocSeverityEscalation(unittest.TestCase):
+    """Network-derived kmalloc size should be escalated to HIGH."""
+
+    def test_nla_get_derived_size_is_high(self):
+        """Size from nla_get_u32 → kmalloc should be HIGH."""
+        src = """\
+int mymod_nl_handler(struct sk_buff *skb, struct genl_info *info) {
+    u32 data_len = nla_get_u32(info->attrs[MYMOD_ATTR_LEN]);
+    buf = kmalloc(data_len, GFP_KERNEL);
+    return 0;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertGreater(len(size_hits), 0)
+        self.assertEqual(size_hits[0]["severity"], "high",
+                         "Network-derived size should be HIGH severity")
+
+    def test_local_computation_stays_medium(self):
+        """Size computed locally (no network input) stays MEDIUM."""
+        src = """\
+int mymod_setup(int count) {
+    int alloc_len = count * 4;
+    buf = kmalloc(alloc_len, GFP_KERNEL);
+    return 0;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertGreater(len(size_hits), 0)
+        self.assertEqual(size_hits[0]["severity"], "medium",
+                         "Non-network size should stay MEDIUM")
+
+
+# ── Dispatch detection: SOCKOPT_MAP names accepted ───────────────
+
+
+class TestDispatchPrefixBypass(unittest.TestCase):
+    """Dispatch extractor should accept names from SOCKOPT_MAP even
+    if they don't match option_prefixes."""
+
+    def test_sockopt_map_name_accepted(self):
+        """case TQUIC_NODELAY: should be extracted if TQUIC_NODELAY
+        is in SOCKOPT_MAP, even if option_prefixes only has MYMOD_."""
+        content = """\
+int tquic_setsockopt(struct sock *sk, int optname, ...) {
+    switch (optname) {
+    case TQUIC_NODELAY:
+        return tquic_set_nodelay(sk);
+    case TQUIC_CC_ALGO:
+        return tquic_set_cc(sk);
+    default:
+        return -ENOPROTOOPT;
+    }
+}
+"""
+        with tempfile.NamedTemporaryFile(
+                suffix=".c", mode="w", delete=False) as f:
+            f.write(content)
+            tmp_path = f.name
+
+        try:
+            pe = PatternExtractor(_ProfileWithMismatchedPrefixes())
+            sf = ScannedFile(
+                rel_path="net/tquic/tquic_socket.c",
+                abs_path=tmp_path,
+                side=Side.KERNEL,
+                language="c",
+                size_bytes=len(content),
+            )
+            result = pe.extract_file(sf)
+            case_names = {d["case"] for d in result.dispatch_entries}
+            self.assertIn("TQUIC_NODELAY", case_names,
+                           "SOCKOPT_MAP name should bypass prefix filter")
+            self.assertIn("TQUIC_CC_ALGO", case_names,
+                           "SOCKOPT_MAP name should bypass prefix filter")
+        finally:
+            os.unlink(tmp_path)
+
+
+class _ProfileWithMismatchedPrefixes:
+    """Profile where option_prefixes don't match SOCKOPT_MAP names."""
+    SOCKOPT_MAP = {
+        "1": "TQUIC_NODELAY",
+        "2": "TQUIC_CC_ALGO",
+    }
+    GENL_FAMILIES = {}
+    IOCTL_MAP = {}
+
+    def get_command_prefixes(self):
+        return ["MYMOD_CMD_"]
+
+    def get_option_prefixes(self):
+        # Intentionally WRONG — doesn't include TQUIC_
+        return ["MYMOD_"]
+
+    def get_attribute_prefixes(self):
+        return ["MYMOD_ATTR_"]
+
+
 if __name__ == "__main__":
     unittest.main()

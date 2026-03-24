@@ -852,5 +852,145 @@ class TestExactNameMatch(unittest.TestCase):
         self.assertEqual(len(like), 2)
 
 
+# ── New C patterns: double-free, GFP_KERNEL, missing break ──────
+
+
+class TestDoubleFree(unittest.TestCase):
+    """CWE-415: double-free detection."""
+
+    def test_double_kfree_flagged(self):
+        src = """\
+void cleanup(struct foo *p) {
+    kfree(p);
+    do_something();
+    kfree(p);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        df = [h for h in hits if h["name"] == "double_free"]
+        self.assertGreater(len(df), 0, "Double kfree must be flagged")
+
+    def test_different_pointers_not_flagged(self):
+        src = """\
+void cleanup(struct foo *a, struct bar *b) {
+    kfree(a);
+    kfree(b);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        df = [h for h in hits if h["name"] == "double_free"]
+        self.assertEqual(len(df), 0, "Different pointers is not double-free")
+
+
+class TestMissingBreak(unittest.TestCase):
+    """CWE-484: missing break in switch."""
+
+    def test_fallthrough_comment_suppressed(self):
+        src = """\
+    switch (x) {
+    case 1:
+        do_a();
+        /* fallthrough */
+    case 2:
+        do_b();
+        break;
+    }
+"""
+        hits = _extract_lint_hits(src, "c")
+        mb = [h for h in hits if h["name"] == "missing_break"]
+        self.assertEqual(len(mb), 0,
+                         "Fallthrough comment should suppress")
+
+
+class TestOverflowSizeMul(unittest.TestCase):
+    """CWE-190: multiplication in kmalloc size."""
+
+    def test_raw_multiply_flagged(self):
+        src = "buf = kmalloc(count * size, GFP_KERNEL);\n"
+        hits = _extract_lint_hits(src, "c")
+        of = [h for h in hits if h["name"] == "overflow_size_mul"]
+        self.assertGreater(len(of), 0,
+                           "Unchecked multiplication in kmalloc should flag")
+
+    def test_array_size_helper_suppressed(self):
+        src = "buf = kmalloc(array_size(count, size), GFP_KERNEL);\n"
+        hits = _extract_lint_hits(src, "c")
+        of = [h for h in hits if h["name"] == "overflow_size_mul"]
+        self.assertEqual(len(of), 0,
+                         "array_size() helper should suppress")
+
+
+class TestKreallocSamePointer(unittest.TestCase):
+    """krealloc to same pointer leaks on NULL."""
+
+    def test_same_pointer_flagged(self):
+        src = "buf = krealloc(buf, new_size, GFP_KERNEL);\n"
+        hits = _extract_lint_hits(src, "c")
+        kr = [h for h in hits if h["name"] == "unchecked_krealloc"]
+        self.assertGreater(len(kr), 0,
+                           "krealloc to same pointer should flag")
+
+
+# ── New Go patterns: TLS, crypto, goroutine loop var ────────────
+
+
+class TestGoTLSInsecure(unittest.TestCase):
+    """gosec: InsecureSkipVerify."""
+
+    def test_skip_verify_flagged(self):
+        src = """\
+client := &http.Client{
+    Transport: &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+    },
+}
+"""
+        hits = _extract_lint_hits(src, "go")
+        tls = [h for h in hits if h["name"] == "tls_insecure_skip"]
+        self.assertGreater(len(tls), 0,
+                           "InsecureSkipVerify: true must be flagged")
+
+
+class TestGoWeakCrypto(unittest.TestCase):
+    """gosec: weak hash algorithms."""
+
+    def test_md5_flagged(self):
+        src = "h := md5.New()\n"
+        hits = _extract_lint_hits(src, "go")
+        wc = [h for h in hits if h["name"] == "weak_crypto_md5"]
+        self.assertGreater(len(wc), 0, "MD5 must be flagged")
+
+    def test_sha1_flagged(self):
+        src = "h := sha1.New()\n"
+        hits = _extract_lint_hits(src, "go")
+        wc = [h for h in hits if h["name"] == "weak_crypto_sha1"]
+        self.assertGreater(len(wc), 0, "SHA-1 must be flagged")
+
+
+class TestGoCommandInjection(unittest.TestCase):
+    """gosec: command injection via exec.Command."""
+
+    def test_variable_command_flagged(self):
+        src = 'cmd := exec.Command(userInput, "-flag")\n'
+        hits = _extract_lint_hits(src, "go")
+        ci = [h for h in hits if h["name"] == "command_injection"]
+        self.assertGreater(len(ci), 0,
+                           "exec.Command with variable must flag")
+
+
+class TestGoContextLeak(unittest.TestCase):
+    """context.WithCancel without defer cancel."""
+
+    def test_cancel_with_defer_suppressed(self):
+        src = """\
+ctx, cancel := context.WithCancel(parentCtx)
+defer cancel()
+"""
+        hits = _extract_lint_hits(src, "go")
+        cl = [h for h in hits if h["name"] == "context_cancel_leak"]
+        self.assertEqual(len(cl), 0,
+                         "defer cancel() should suppress")
+
+
 if __name__ == "__main__":
     unittest.main()

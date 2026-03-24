@@ -67,41 +67,238 @@ class AnalysisConfig:
 
 
 def generate_config_template(profile_name: str = "custom",
-                             module_name: str = "mymod") -> dict:
-    """Generate a starter .boundary-mapper.json for a new project."""
+                             module_name: str = "mymod",
+                             repo_root: Path = None) -> dict:
+    """Generate a .boundary-mapper.json by scanning the repo.
+
+    If repo_root is provided, auto-discovers:
+    - Source directories (kernel, userspace, shared, test)
+    - #define prefixes (command, option, attribute)
+    - Sockopt maps from #define constants
+    - Genetlink families from genl_register_family calls
+    """
+    if repo_root and repo_root.is_dir():
+        return _auto_discover(repo_root, module_name, profile_name)
+    return _static_template(profile_name, module_name)
+
+
+def _static_template(profile_name: str, module_name: str) -> dict:
+    """Fallback: generate a minimal template when repo isn't available."""
     prefix = module_name.upper()
     return {
         "profile": profile_name,
-        "db": ".boundary_mapper.db",
-        "output_dir": "boundary_reports",
         "custom": {
             "name": module_name,
-            "description": f"{module_name} kernel module boundary profile",
-            "kernel_paths": [f"net/{module_name}/**/*.c",
-                             f"net/{module_name}/**/*.h"],
-            "userspace_paths": [f"tools/{module_name}/**/*.go",
-                                f"tools/{module_name}/**/*.c"],
-            "shared_paths": [f"include/uapi/linux/{module_name}*.h"],
-            "test_paths": [f"tools/testing/selftests/net/{module_name}/**/*"],
+            "description": f"{module_name} boundary profile",
+            "kernel_paths": [f"**/*.c", f"**/*.h"],
+            "userspace_paths": [],
+            "shared_paths": [],
             "command_prefixes": [f"{prefix}_CMD_"],
             "option_prefixes": [f"{prefix}_"],
             "attribute_prefixes": [f"{prefix}_ATTR_"],
-            "directories": [
-                {"path": f"net/{module_name}/", "side": "kernel",
-                 "description": f"Kernel {module_name} module"},
-                {"path": f"include/uapi/linux/{module_name}",
-                 "side": "shared", "description": "UAPI headers"},
-                {"path": f"tools/{module_name}/", "side": "userspace",
-                 "description": "Userspace daemon"},
-            ],
+            "directories": [],
             "sockopt_map": {},
             "genl_families": {},
-            "ioctl_map": {},
-            "future_reserved_sockopts": [],
-            "diagnostic_sockopts": [],
-            "kernel_only_genl": [],
         },
     }
+
+
+def _auto_discover(repo_root: Path, module_name: str,
+                   profile_name: str) -> dict:
+    """Scan the repo and auto-populate the config."""
+    import os
+    import re
+    from collections import Counter
+
+    prefix = module_name.upper()
+
+    # ── Phase 1: Discover directory structure ──
+    source_dirs = {"c": [], "h": [], "go": [], "py": [], "rs": [],
+                   "ts": [], "java": []}
+    ext_map = {".c": "c", ".h": "h", ".go": "go", ".py": "py",
+               ".rs": "rs", ".ts": "ts", ".tsx": "ts", ".js": "ts",
+               ".java": "java"}
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                 "build", "dist", "target", ".boundary_mapper.db"}
+
+    for dirpath, dirnames, filenames in os.walk(str(repo_root)):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        rel_dir = os.path.relpath(dirpath, str(repo_root))
+        if rel_dir == ".":
+            rel_dir = ""
+        for fname in filenames:
+            ext = os.path.splitext(fname)[1].lower()
+            lang = ext_map.get(ext)
+            if lang:
+                source_dirs[lang].append(rel_dir)
+
+    # Deduplicate and find top-level source directories
+    def top_dirs(dirs):
+        unique = sorted(set(d for d in dirs if d))
+        # Collapse to parent dirs (keep dirs that contain >2 files)
+        counts = Counter(dirs)
+        tops = []
+        for d in unique:
+            if counts[d] >= 1:
+                # Check if already covered by a parent
+                covered = any(d.startswith(t + "/") for t in tops)
+                if not covered:
+                    tops.append(d)
+        return tops[:20]  # cap at 20
+
+    c_dirs = top_dirs(source_dirs["c"] + source_dirs["h"])
+    go_dirs = top_dirs(source_dirs["go"])
+    py_dirs = top_dirs(source_dirs["py"])
+    rs_dirs = top_dirs(source_dirs["rs"])
+    ts_dirs = top_dirs(source_dirs["ts"])
+    java_dirs = top_dirs(source_dirs["java"])
+
+    # Build path patterns
+    kernel_paths = []
+    userspace_paths = []
+    shared_paths = []
+    test_paths = []
+    directories = []
+
+    # Classify directories by heuristic
+    for d in c_dirs:
+        pat = f"{d}/**/*.c" if d else "**/*.c"
+        hpat = f"{d}/**/*.h" if d else "**/*.h"
+        dl = d.lower()
+        if any(k in dl for k in ("test", "selftests", "kunit", "spec")):
+            test_paths.extend([pat, hpat])
+            directories.append({"path": d + "/", "side": "tooling",
+                                "description": "Tests"})
+        elif any(k in dl for k in ("uapi", "shared", "public")):
+            shared_paths.extend([pat, hpat])
+            directories.append({"path": d + "/", "side": "shared",
+                                "description": "Shared/UAPI headers"})
+        elif any(k in dl for k in ("tools", "cmd", "cli", "userspace",
+                                    "daemon", "agent", "client")):
+            userspace_paths.extend([pat, hpat])
+            directories.append({"path": d + "/", "side": "userspace",
+                                "description": "Userspace"})
+        else:
+            kernel_paths.extend([pat, hpat])
+            directories.append({"path": d + "/", "side": "kernel",
+                                "description": "Source"})
+
+    for d in go_dirs:
+        pat = f"{d}/**/*.go" if d else "**/*.go"
+        userspace_paths.append(pat)
+        directories.append({"path": d + "/", "side": "userspace",
+                            "description": "Go source"})
+    for d in py_dirs:
+        userspace_paths.append(f"{d}/**/*.py" if d else "**/*.py")
+    for d in rs_dirs:
+        kernel_paths.append(f"{d}/**/*.rs" if d else "**/*.rs")
+    for d in ts_dirs:
+        userspace_paths.append(f"{d}/**/*.ts" if d else "**/*.ts")
+    for d in java_dirs:
+        userspace_paths.append(f"{d}/**/*.java" if d else "**/*.java")
+
+    # ── Phase 2: Scan headers for prefixes and constants ──
+    define_re = re.compile(r'^#define\s+(\w+)\s+(\d+)', re.MULTILINE)
+    genl_re = re.compile(r'genl_register_family\s*\(\s*&(\w+)\s*\)')
+    prefix_counter = Counter()
+    sockopt_map = {}
+    genl_families = {}
+
+    header_files = []
+    for dirpath, _, filenames in os.walk(str(repo_root)):
+        rel = os.path.relpath(dirpath, str(repo_root))
+        if any(s in rel for s in (".git", "node_modules")):
+            continue
+        for fname in filenames:
+            if fname.endswith(".h"):
+                header_files.append(os.path.join(dirpath, fname))
+
+    # Also scan .c files for genl_register_family
+    c_files = []
+    for dirpath, _, filenames in os.walk(str(repo_root)):
+        rel = os.path.relpath(dirpath, str(repo_root))
+        if any(s in rel for s in (".git", "node_modules")):
+            continue
+        for fname in filenames:
+            if fname.endswith(".c"):
+                c_files.append((os.path.join(dirpath, fname),
+                                os.path.relpath(
+                                    os.path.join(dirpath, fname),
+                                    str(repo_root))))
+
+    for hpath in header_files[:200]:  # cap for speed
+        try:
+            with open(hpath, "r", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        for m in define_re.finditer(content):
+            name = m.group(1)
+            val = m.group(2)
+            # Count prefix patterns (first 2 underscore-delimited parts)
+            parts = name.split("_")
+            if len(parts) >= 2:
+                pfx = "_".join(parts[:2]) + "_"
+                prefix_counter[pfx] += 1
+            # Detect sockopt-like constants (prefix matches module, numeric val)
+            if name.startswith(prefix) and val.isdigit():
+                num = int(val)
+                if 0 < num < 1000:
+                    sockopt_map[str(num)] = name
+
+    for cpath, crel in c_files[:200]:
+        try:
+            with open(cpath, "r", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        for m in genl_re.finditer(content):
+            fam_var = m.group(1)
+            genl_families[fam_var] = {
+                "ops_var": "",
+                "source_file": crel,
+                "commands": {},
+            }
+
+    # ── Phase 3: Infer prefixes ──
+    # Use the module name as primary prefix, discover CMD_ and ATTR_ variants
+    discovered_prefixes = []
+    for pfx, count in prefix_counter.most_common(30):
+        if count >= 3 and pfx.startswith(prefix):
+            discovered_prefixes.append(pfx)
+
+    command_prefixes = [p for p in discovered_prefixes if "_CMD_" in p]
+    attribute_prefixes = [p for p in discovered_prefixes if "_ATTR_" in p]
+    option_prefixes = [f"{prefix}_"] if any(
+        p.startswith(prefix) for p in discovered_prefixes) else []
+
+    # Fallback: if no prefixes found from scanning, use module name
+    if not command_prefixes:
+        command_prefixes = [f"{prefix}_CMD_"]
+    if not option_prefixes:
+        option_prefixes = [f"{prefix}_"]
+    if not attribute_prefixes:
+        attribute_prefixes = [f"{prefix}_ATTR_"]
+
+    # ── Build config ──
+    config = {
+        "profile": profile_name,
+        "custom": {
+            "name": module_name,
+            "description": f"{module_name} boundary profile (auto-discovered)",
+            "kernel_paths": kernel_paths or ["**/*.c", "**/*.h"],
+            "userspace_paths": userspace_paths,
+            "shared_paths": shared_paths,
+            "test_paths": test_paths,
+            "command_prefixes": command_prefixes,
+            "option_prefixes": option_prefixes,
+            "attribute_prefixes": attribute_prefixes,
+            "directories": directories,
+            "sockopt_map": sockopt_map,
+            "genl_families": genl_families,
+        },
+    }
+    return config
 
 
 def generate_claude_skill(module_name: str = "mymod",

@@ -139,8 +139,8 @@ def load_store(args) -> FactStore:
 # ─── Commands ───
 
 def cmd_init(args):
-    """Create a .boundary-mapper.json config file and optionally a Claude skill."""
-    module_name = args.module or "mymod"
+    """Scan the repo and generate .boundary-mapper.json automatically."""
+    module_name = args.module or Path(args.repo).resolve().name
     profile = args.profile if args.profile != "_auto_" else "custom"
     repo = Path(args.repo).resolve()
     cfg_path = repo / CONFIG_FILENAME
@@ -153,7 +153,16 @@ def cmd_init(args):
     if profile in BUILTIN_PROFILES and profile != "base":
         data = {"profile": profile}
     else:
-        data = generate_config_template(profile, module_name)
+        print(f"Scanning {repo} ...")
+        data = generate_config_template(profile, module_name, repo_root=repo)
+        custom = data.get("custom", {})
+        n_dirs = len(custom.get("directories", []))
+        n_sock = len(custom.get("sockopt_map", {}))
+        n_genl = len(custom.get("genl_families", {}))
+        n_kp = len(custom.get("kernel_paths", []))
+        n_up = len(custom.get("userspace_paths", []))
+        print(f"Discovered: {n_dirs} directories, {n_kp} kernel paths, "
+              f"{n_up} userspace paths, {n_sock} sockopts, {n_genl} genl families")
 
     with open(cfg_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -165,11 +174,12 @@ def cmd_init(args):
 
     print()
     if profile == "custom":
-        print(f"Next steps:")
-        print(f"  1. Edit {CONFIG_FILENAME} — fill in sockopt_map, genl_families, paths")
-        print(f"  2. Run: boundary-mapper scan")
+        print(f"Ready to scan. Run:")
+        print(f"  boundary-mapper scan --fresh")
+        print()
+        print(f"Review {CONFIG_FILENAME} if you want to adjust paths or prefixes.")
         if not args.skill:
-            print(f"  3. Run: boundary-mapper init {module_name} --skill  (generate Claude skill)")
+            print(f"Add --skill to generate a Claude Code skill for AI assistants.")
     else:
         print(f"Using builtin profile: {profile}")
         print(f"Run: boundary-mapper scan")

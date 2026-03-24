@@ -1411,6 +1411,115 @@ def _audit_source_lines(repo_root: Path, func_name: str, info: dict,
     print()
 
 
+def cmd_dump(args):
+    """Dump everything the tool knows — one line per fact, greppable."""
+    from collections import defaultdict
+    store = load_store(args)
+
+    query = (args.query or "").lower()
+
+    # ── Functions ──
+    for sym in store.find_symbols(kind="function_def", limit=50000):
+        status = sym.properties.get("body_status", "?")
+        lines = sym.properties.get("body_lines", 0)
+        sig = sym.properties.get("signature", "")
+        tag = status.upper()
+        line = (f"FUNC  {sym.name}  {sym.file_path}:{sym.line_start}"
+                f"  {tag} {lines}L"
+                f"{'  sig=' + sig if sig else ''}")
+        if not query or query in line.lower():
+            color = GREEN if status == "live" else (
+                YELLOW if "stub" in status else (
+                RED if status in ("empty", "missing") else lambda x: x))
+            print(color(line))
+
+    # ── Function declarations ──
+    for sym in store.find_symbols(kind="function_decl", limit=20000):
+        sig = sym.properties.get("signature", "")
+        line = (f"DECL  {sym.name}  {sym.file_path}:{sym.line_start}"
+                f"{'  sig=' + sig if sig else ''}")
+        if not query or query in line.lower():
+            print(DIM(line))
+
+    # ── Call edges ──
+    call_edges = store.get_edges(kind="calls", limit=200000)
+    for edge in call_edges:
+        caller = edge.properties.get("caller", "")
+        callee = edge.properties.get("callee", "")
+        ev = edge.evidence[0] if edge.evidence else None
+        fp = ev.file_path if ev else "?"
+        ln = ev.line_start if ev else 0
+        line = f"CALL  {caller} -> {callee}  {fp}:{ln}"
+        if not query or query in line.lower():
+            print(line)
+
+    # ── Ops table edges ──
+    impl_edges = store.get_edges(kind="implements", limit=20000)
+    for edge in impl_edges:
+        ops = edge.properties.get("ops_table", "")
+        field = edge.properties.get("field", "")
+        handler = edge.properties.get("handler", "")
+        line = f"OPS   {ops}.{field} = {handler}"
+        if not query or query in line.lower():
+            print(CYAN(line))
+
+    # ── Structs ──
+    for sym in store.find_symbols(kind="struct", limit=5000):
+        line = f"STRUCT  {sym.name}  {sym.file_path}:{sym.line_start}"
+        if not query or query in line.lower():
+            print(line)
+
+    # ── Enums ──
+    for sym in store.find_symbols(kind="enum", limit=5000):
+        line = f"ENUM  {sym.name}  {sym.file_path}:{sym.line_start}"
+        if not query or query in line.lower():
+            print(line)
+
+    # ── Constants ──
+    for sym in store.find_symbols(kind="constant", limit=10000):
+        val = sym.properties.get("value", "")
+        line = f"CONST  {sym.name} = {val}  {sym.file_path}:{sym.line_start}"
+        if not query or query in line.lower():
+            print(DIM(line))
+
+    # ── Registrations (init, exit, export, register) ──
+    for sym in store.find_symbols(kind="registration", limit=5000):
+        itype = sym.properties.get("internal_type", sym.properties.get("type", ""))
+        target = sym.properties.get("target", "")
+        line = f"REG   {itype}  {target}  {sym.file_path}:{sym.line_start}"
+        if not query or query in line.lower():
+            print(CYAN(line))
+
+    # ── Surfaces ──
+    for surf in store.get_surfaces():
+        p = surf.properties
+        sub = p.get("substatus", surf.status.value)
+        imp = p.get("importance_score", "")
+        line = (f"SURFACE  {surf.boundary_type.value}  {surf.name}"
+                f"  {sub}  imp={imp}"
+                f"  handler={surf.handler or 'NONE'}")
+        if not query or query in line.lower():
+            print(BLUE(line))
+
+    # ── Findings (HIGH and MEDIUM only unless --all) ──
+    show_all_findings = getattr(args, "verbose", False)
+    for f in store.get_findings(limit=50000):
+        if not show_all_findings and f.severity.value in ("low", "info"):
+            continue
+        ev = f.evidence[0] if f.evidence else None
+        fp = ev.file_path if ev else "?"
+        ln = ev.line_start if ev else 0
+        line = (f"FINDING  {f.severity.value.upper()}  {f.category}"
+                f"  {f.title[:80]}  {fp}:{ln}"
+                f"  action={f.recommendation}")
+        if not query or query in line.lower():
+            color = RED if f.severity.value == "high" else (
+                YELLOW if f.severity.value == "medium" else lambda x: x)
+            print(color(line))
+
+    store.close()
+
+
 def cmd_show(args):
     """Show detail for a specific surface."""
     store = load_store(args)
@@ -1613,6 +1722,25 @@ def main():
     p_trace.add_argument("--depth", type=int, default=2,
                          help="Depth for recursive caller/callee display (default: 2)")
 
+    # dump
+    p_dump = sub.add_parser("dump",
+        help="Dump everything — greppable",
+        description=(
+            "One line per fact. Grep for anything.\n\n"
+            "  boundary-mapper dump                     Everything\n"
+            "  boundary-mapper dump path_free           Filter to matches\n"
+            "  boundary-mapper dump | grep STUB         All stubs\n"
+            "  boundary-mapper dump | grep EMPTY        All empty functions\n"
+            "  boundary-mapper dump | grep CALL         All call edges\n"
+            "  boundary-mapper dump | grep FINDING      All findings\n"
+            "  boundary-mapper dump | grep SURFACE      All surfaces\n"
+            "  boundary-mapper dump -v                  Include LOW/INFO findings\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_dump.add_argument("query", nargs="?", default=None,
+                        help="Filter output (case-insensitive substring match)")
+
     # diagnose
     p_diag = sub.add_parser("diagnose",
         help="Health check — one function or whole repo",
@@ -1674,6 +1802,7 @@ def main():
         "show-surface": cmd_show,
         "trace": cmd_trace,
         "diagnose": cmd_diagnose,
+        "dump": cmd_dump,
         "stats": cmd_stats,
         "profiles": cmd_profiles,
         "languages": cmd_languages,

@@ -31,6 +31,34 @@ class PatternExtractor:
         self.profile = profile
         # Cache compiled regexes per language
         self._compiled: dict[str, dict[str, re.Pattern]] = {}
+        # Cache known dispatch names from profile maps
+        self._known_dispatch_names: set[str] | None = None
+
+    def _get_known_dispatch_names(self) -> set[str]:
+        """Return all constant names from SOCKOPT_MAP, IOCTL_MAP, and
+        GENL_FAMILIES that the tool is tracking.
+
+        These names must always be accepted by the dispatch filter —
+        otherwise the tool declares them "dead" despite having actual
+        case handlers in kernel source.
+        """
+        if self._known_dispatch_names is not None:
+            return self._known_dispatch_names
+        names: set[str] = set()
+        if hasattr(self.profile, "SOCKOPT_MAP"):
+            names.update(self.profile.SOCKOPT_MAP.values())
+        if hasattr(self.profile, "IOCTL_MAP"):
+            names.update(self.profile.IOCTL_MAP.values())
+        if hasattr(self.profile, "GENL_FAMILIES"):
+            for family_info in self.profile.GENL_FAMILIES.values():
+                if isinstance(family_info, dict):
+                    cmds = family_info.get("commands", [])
+                    if isinstance(cmds, list):
+                        names.update(cmds)
+                    elif isinstance(cmds, dict):
+                        names.update(cmds.values())
+        self._known_dispatch_names = names
+        return names
 
     def _compile(self, lang: LanguageDef) -> dict[str, re.Pattern]:
         """Compile all regexes for a language (cached)."""
@@ -163,12 +191,20 @@ class PatternExtractor:
                 if bp.extract_type == "dispatch":
                     case_grp = bp.groups.get("case", 1)
                     case_name = m.group(case_grp)
-                    # Filter to profile-relevant cases
+                    # Filter to profile-relevant cases.
+                    # Include: option/command prefix matches AND any name
+                    # that appears in SOCKOPT_MAP/IOCTL_MAP/GENL_FAMILIES
+                    # (these are the exact names we're looking for — they
+                    # must not be silently dropped).
                     prefixes = (self.profile.get_command_prefixes() +
                                 self.profile.get_option_prefixes())
-                    if prefixes and not any(case_name.startswith(p)
-                                            for p in prefixes):
-                        continue
+                    known_names = self._get_known_dispatch_names()
+                    if prefixes or known_names:
+                        prefix_match = any(case_name.startswith(p)
+                                           for p in prefixes)
+                        exact_match = case_name in known_names
+                        if not prefix_match and not exact_match:
+                            continue
                     result.dispatch_entries.append({
                         "case": case_name,
                         "file": sf.rel_path,
@@ -802,13 +838,29 @@ class PatternExtractor:
             pass
         return False
 
+    # Log/debug macro names — uses of a freed variable inside these
+    # are safe (read-only, typically printing an address or ID).
+    _LOG_MACROS = re.compile(
+        r'(?:pr_\w+|dev_\w+|printk|net_\w+|trace_\w+|'
+        r'WARN\w*|BUG_ON|ASSERT\w*|dbg|debug|'
+        r'\w+_dbg|NL_SET_ERR_MSG\w*)\s*\(',
+    )
+
     def _check_uaf_false_positive(self, m, content: str) -> bool:
         """Check if a use-after-free match is a false positive.
 
-        Suppresses if the next use of the variable after kfree is:
-        - A reassignment (ptr = ...)
-        - NULLing a struct field (conn->field = NULL)
-        - Only in a log macro
+        The regex captures kfree(VAR); ... VAR as a match, but many
+        post-kfree references to VAR are safe:
+
+        1. VAR = ...           (reassignment — no longer the freed ptr)
+        2. VAR->field = NULL   (NULLing a field — cleanup pattern)
+        3. Log/debug macro     (read-only, typically printing address)
+        4. The "use" is a DIFFERENT variable that happens to contain
+           the same identifier as a substring (e.g., kfree(path) then
+           path_id — the regex backreference is too broad)
+        5. return / goto after kfree (no actual use of the freed ptr)
+
+        Returns True if the match is a false positive (should suppress).
         """
         try:
             var_name = m.group(1)
@@ -827,12 +879,164 @@ class PatternExtractor:
         # Suppress if the next use is NULLing a struct field
         if re.search(r'\w+->\w+\s*=\s*NULL\s*;', rest):
             return True
-        # Suppress if var only appears in a log/print macro
-        if re.search(
-            rf'(?:pr_\w+|dev_\w+|printk|net_\w+)\s*\(.*\b{re.escape(var_name)}\b',
-            rest, re.DOTALL,
-        ):
+        # Suppress if only a return/goto follows (no actual use)
+        stripped = rest.strip()
+        if stripped.startswith(("return", "goto", "}")):
             return True
+
+        # Find all uses of the freed variable name in the rest.
+        # For each use, check if it's actually the freed pointer or
+        # a different variable / safe context.
+        var_esc = re.escape(var_name)
+        uses = list(re.finditer(rf'\b{var_esc}\b', rest))
+        if not uses:
+            return True  # no actual use found (regex overmatch)
+
+        all_uses_safe = True
+        for use in uses:
+            use_start = use.start()
+            # Get the line containing this use
+            line_start = rest.rfind("\n", 0, use_start) + 1
+            line_end = rest.find("\n", use_start)
+            if line_end < 0:
+                line_end = len(rest)
+            use_line = rest[line_start:line_end]
+
+            # Check if this use is inside a log/debug macro
+            if self._LOG_MACROS.search(use_line):
+                continue  # safe — log/debug only
+
+            # Check if this is a reassignment (var = ...)
+            after_var = rest[use.end():use.end() + 20].lstrip()
+            if after_var.startswith("=") and not after_var.startswith("=="):
+                continue  # reassignment, not a use
+
+            # Check if the "use" is actually a different variable
+            # (e.g., "path" matched inside "path_id" or "old_path")
+            before_char = rest[use_start - 1] if use_start > 0 else " "
+            after_char = rest[use.end()] if use.end() < len(rest) else " "
+            if before_char.isalnum() or before_char == "_":
+                continue  # part of a longer identifier
+            if after_char.isalnum() or after_char == "_":
+                continue  # part of a longer identifier
+
+            # This is a real use of the freed pointer — not safe
+            all_uses_safe = False
+            break
+
+        return all_uses_safe
+
+    # Patterns indicating a size variable comes from network/user input
+    _NETWORK_INPUT_PATTERNS = re.compile(
+        r'(?:copy_from_user|get_user|nla_get_|skb->|ntohs|ntohl|'
+        r'nlmsg_|genlmsg_|recvmsg|read_from_|parse_|'
+        r'msg->|hdr->|pkt->|frame->|payload)',
+    )
+
+    def _assess_kmalloc_severity(self, m, content: str,
+                                  default_severity: str) -> str:
+        """Escalate kmalloc severity if size comes from network input.
+
+        If the size variable is derived from network/user input
+        (copy_from_user, nla_get_*, skb data, etc.), escalate to HIGH.
+        Otherwise keep the default severity.
+        """
+        size_match = re.search(r'kmalloc\s*\(\s*(\w+)', m.group(0))
+        if not size_match:
+            return default_severity
+        var = size_match.group(1)
+        var_esc = re.escape(var)
+
+        # Look backward for assignment from network sources
+        lookbehind = content[max(0, m.start() - 1500):m.start()]
+
+        # Find assignment to this variable
+        assign_match = re.search(
+            rf'{var_esc}\s*=\s*([^;]+);', lookbehind)
+        if assign_match:
+            rhs = assign_match.group(1)
+            if self._NETWORK_INPUT_PATTERNS.search(rhs):
+                return "high"
+
+        # Also check if the function itself has network-input parameters
+        # (recvmsg handler, netlink handler, etc.)
+        func_start = content[:m.start()].rfind("\n{")
+        if func_start > 0:
+            func_sig_start = content[:func_start].rfind("\n")
+            func_sig = content[max(0, func_sig_start):func_start]
+            if re.search(r'(?:recvmsg|sendmsg|nl_\w+|genl_\w+|'
+                         r'sk_buff|msghdr)', func_sig):
+                return "high"
+
+        return default_severity
+
+    def _check_kmalloc_size_safe(self, m, content: str) -> bool:
+        """Check if a variable-sized kmalloc has a bounded size.
+
+        Returns True (suppress) if the size is:
+        1. A compile-time constant (ALL_CAPS, sizeof, _SIZE/_MAX suffix)
+        2. Bounded by a comparison (if (len > MAX_VAL))
+        3. Clamped by min/clamp/max helpers
+        4. Assigned from a bounded source (sizeof, constant, another
+           bounded variable via assignment chain)
+        """
+        size_match = re.search(r'kmalloc\s*\(\s*(\w+)', m.group(0))
+        if not size_match:
+            return False
+        var = size_match.group(1)
+
+        # 1. Compile-time constant names
+        if (var.isupper() or
+                var.startswith(("MAX_", "MIN_", "sizeof")) or
+                var.endswith(("_SIZE", "_LEN", "_MAX",
+                              "_LIMIT", "_CAP", "_BYTES"))):
+            return True
+
+        # 2. Look backward for bounds checks on this variable.
+        # Expand search to 1500 chars to catch checks further up.
+        lookbehind = content[max(0, m.start() - 1500):m.start()]
+        var_esc = re.escape(var)
+
+        bounds_patterns = [
+            # if (var > CONST)  /  if (var >= CONST)
+            rf'if\s*\([^)]*{var_esc}\s*>[>=]\s*\w+',
+            # if (CONST < var)
+            rf'if\s*\([^)]*\w+\s*<[<=]\s*{var_esc}',
+            # if (var > 256)  /  if (var > 1440)  etc.
+            rf'if\s*\([^)]*{var_esc}\s*>\s*\d+',
+            # if (var != ...)  /  if (!var)
+            rf'if\s*\(\s*{var_esc}\s*[!>]',
+            # min(var, ...)  /  min_t(..., var, ...)
+            rf'min(?:_t)?\s*\([^)]*{var_esc}',
+            # var = min(...)
+            rf'{var_esc}\s*=\s*min(?:_t)?\s*\(',
+            # clamp(var, ...)
+            rf'clamp\s*\([^)]*{var_esc}',
+            # check_*_overflow
+            rf'check_\w*overflow\s*\([^)]*{var_esc}',
+        ]
+
+        if any(re.search(p, lookbehind) for p in bounds_patterns):
+            return True
+
+        # 3. Trace assignment: if var = sizeof(...) or var = CONST
+        assign_match = re.search(
+            rf'{var_esc}\s*=\s*(\w[\w\s()*]*?)\s*;',
+            lookbehind,
+        )
+        if assign_match:
+            rhs = assign_match.group(1).strip()
+            # Assigned from sizeof(...)
+            if "sizeof" in rhs:
+                return True
+            # Assigned from a constant (ALL_CAPS or numeric literal)
+            if rhs.isupper() or re.fullmatch(r'\d+', rhs):
+                return True
+            # Assigned from min/clamp
+            if re.match(r'min(?:_t)?\s*\(', rhs) or \
+               re.match(r'clamp\s*\(', rhs):
+                return True
+
         return False
 
     def _check_deadlock_false_positive(self, m) -> bool:
@@ -932,32 +1136,20 @@ class PatternExtractor:
 
                 # Pattern-specific checks for user_size_to_kmalloc
                 if lp.name == "user_size_to_kmalloc":
-                    size_match = re.search(r'kmalloc\s*\(\s*(\w+)', m.group(0))
-                    if size_match:
-                        var = size_match.group(1)
-
-                        # Skip constant-size names — these are compile-time
-                        # constants, not user-controlled sizes.
-                        if (var.isupper() or
-                                var.startswith(("MAX_", "MIN_", "sizeof")) or
-                                var.endswith(("_SIZE", "_LEN", "_MAX",
-                                              "_LIMIT", "_CAP"))):
-                            continue
-
-                        lookbehind = content[max(0, m.start() - 500):m.start()]
-                        bounds_patterns = [
-                            rf'if\s*\(\s*{re.escape(var)}\s*[>!]',
-                            rf'if\s*\([^)]*{re.escape(var)}\s*>',
-                            rf'min\s*\(\s*{re.escape(var)}',
-                            rf'{re.escape(var)}\s*=\s*min',
-                        ]
-                        if any(re.search(p, lookbehind) for p in bounds_patterns):
-                            continue
+                    if self._check_kmalloc_size_safe(m, content):
+                        continue
 
                 snippet = m.group(0)[:120].strip()
+
+                # Dynamic severity adjustment
+                severity = lp.severity
+                if lp.name == "user_size_to_kmalloc":
+                    severity = self._assess_kmalloc_severity(
+                        m, content, lp.severity)
+
                 result.lint_hits.append({
                     "name": lp.name,
-                    "severity": lp.severity,
+                    "severity": severity,
                     "category": lp.category,
                     "message": lp.message,
                     "recommendation": lp.recommendation,

@@ -696,7 +696,9 @@ def _show_full_context(fwd, rev, func, func_info, func_decls, depth):
 def cmd_diagnose(args):
     """Full health check on a function — everything the tool knows in one place."""
     from collections import defaultdict
+    import re as _re
     store = load_store(args)
+    repo_root = Path(args.repo).resolve()
 
     func = args.function
 
@@ -934,7 +936,201 @@ def cmd_diagnose(args):
         print(f"  VERDICT: ✅ HEALTHY — no issues detected")
     print()
 
+    # ── Line-by-line source audit ──
+    if info and info.get("file"):
+        _audit_source_lines(repo_root, func, info, func_info, fwd)
+
     store.close()
+
+
+def _audit_source_lines(repo_root: Path, func_name: str, info: dict,
+                        func_info: dict, fwd: dict):
+    """Read the actual source file and annotate every line of the function body."""
+    import re as _re
+
+    file_path = repo_root / info["file"]
+    if not file_path.exists():
+        return
+
+    try:
+        with open(file_path, "r", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return
+
+    start_line = info.get("line", 0)
+    body_lines = info.get("body_lines", 0)
+    if not start_line or not body_lines:
+        return
+
+    end_line = start_line + body_lines + 1  # +1 for closing brace
+    end_line = min(end_line, len(all_lines))
+
+    print(f"  SOURCE: {info['file']}:{start_line}-{end_line}")
+    print(f"  {'─'*56}")
+
+    # Patterns for annotation
+    re_call = _re.compile(r'\b([a-zA-Z_]\w{2,})\s*\(')
+    re_alloc = _re.compile(r'(\w+)\s*=\s*(k[mz]alloc|kstrdup|kmemdup|alloc_skb|kzalloc_node)\s*\(')
+    re_null_check = _re.compile(r'if\s*\(\s*!?\s*(\w+)\s*\)')
+    re_lock = _re.compile(r'(spin_lock|mutex_lock|spin_lock_bh|spin_lock_irq|spin_lock_irqsave|read_lock|write_lock|rcu_read_lock)\s*\(')
+    re_unlock = _re.compile(r'(spin_unlock|mutex_unlock|spin_unlock_bh|spin_unlock_irq|spin_unlock_irqrestore|read_unlock|write_unlock|rcu_read_unlock)\s*\(')
+    re_goto = _re.compile(r'\bgoto\s+(\w+)\s*;')
+    re_label = _re.compile(r'^(\w+)\s*:')
+    re_kfree = _re.compile(r'kfree\s*\(\s*(\w+)\s*\)')
+    re_return = _re.compile(r'\breturn\b\s*(.*?)\s*;')
+    re_deref = _re.compile(r'(\w+)->(\w+)')
+    re_assign_call = _re.compile(r'(\w+)\s*=\s*(\w{3,})\s*\(')
+    re_copy = _re.compile(r'(copy_from_user|copy_to_user)\s*\(')
+    re_sprintf = _re.compile(r'\b(sprintf|strcpy|strcat)\s*\(')
+    re_todo = _re.compile(r'(TODO|FIXME|HACK|XXX|STUB)', _re.IGNORECASE)
+
+    # C keywords and macros to skip in call detection
+    skip_calls = frozenset({
+        "if", "else", "while", "for", "do", "switch", "case", "return",
+        "goto", "sizeof", "typeof", "offsetof", "likely", "unlikely",
+        "WARN", "WARN_ON", "WARN_ON_ONCE", "BUG", "BUG_ON",
+        "IS_ERR", "PTR_ERR", "ERR_PTR", "IS_ENABLED",
+        "container_of", "ARRAY_SIZE", "min", "max", "min_t", "max_t",
+        "LIST_HEAD", "INIT_LIST_HEAD", "NULL",
+        "pr_err", "pr_info", "pr_warn", "pr_debug", "printk",
+    })
+
+    # Track state across lines
+    open_locks = []  # stack of lock names
+    alloc_vars = {}  # var → line where allocated (awaiting NULL check)
+    freed_vars = set()  # vars that have been kfree'd
+    line_annotations = []
+
+    for line_idx in range(start_line - 1, min(end_line, len(all_lines))):
+        line_num = line_idx + 1
+        raw = all_lines[line_idx].rstrip("\n")
+        stripped = raw.strip()
+        annotations = []
+
+        # Skip empty/comment lines
+        if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
+            if re_todo.search(stripped):
+                annotations.append("📝 TODO")
+            line_annotations.append((line_num, raw, annotations))
+            continue
+
+        # ── Lock tracking ──
+        for m in re_lock.finditer(stripped):
+            lock_type = m.group(1)
+            open_locks.append((lock_type, line_num))
+            annotations.append(f"🔒 {lock_type}")
+
+        for m in re_unlock.finditer(stripped):
+            unlock_type = m.group(1)
+            if open_locks:
+                lock_type, lock_line = open_locks.pop()
+                annotations.append(f"🔓 {unlock_type} (matches L{lock_line})")
+            else:
+                annotations.append(f"⚠️ {unlock_type} — no matching lock!")
+
+        # ── Allocation tracking ──
+        for m in re_alloc.finditer(stripped):
+            var = m.group(1)
+            alloc_fn = m.group(2)
+            alloc_vars[var] = line_num
+            annotations.append(f"📦 {alloc_fn} → {var}")
+
+        # ── NULL check clears allocation warning ──
+        for m in re_null_check.finditer(stripped):
+            var = m.group(1)
+            if var in alloc_vars:
+                annotations.append(f"✅ NULL check on {var} (alloc L{alloc_vars[var]})")
+                del alloc_vars[var]
+
+        # ── kfree tracking ──
+        for m in re_kfree.finditer(stripped):
+            var = m.group(1)
+            freed_vars.add(var)
+            annotations.append(f"🗑️ kfree({var})")
+
+        # ── Use after free ──
+        for m in re_deref.finditer(stripped):
+            var = m.group(1)
+            if var in freed_vars:
+                annotations.append(f"❌ USE AFTER FREE: {var} was freed")
+
+        # ── Unsafe functions ──
+        for m in re_sprintf.finditer(stripped):
+            annotations.append(f"⚠️ {m.group(1)} — no bounds check")
+
+        for m in re_copy.finditer(stripped):
+            # Check if return value is checked (= copy_from_user on same line)
+            if "=" not in stripped.split(m.group(0))[0]:
+                annotations.append(f"⚠️ {m.group(1)} return not checked")
+
+        # ── goto ──
+        for m in re_goto.finditer(stripped):
+            label = m.group(1)
+            if open_locks:
+                annotations.append(f"↪ goto {label} — {len(open_locks)} lock(s) held!")
+            else:
+                annotations.append(f"↪ goto {label}")
+
+        # ── Labels ──
+        for m in re_label.finditer(stripped):
+            if m.group(1) not in ("default", "case"):
+                annotations.append(f"🏷️ label {m.group(1)}")
+
+        # ── Function calls — look up every callee ──
+        for m in re_call.finditer(stripped):
+            callee = m.group(1)
+            if callee in skip_calls:
+                continue
+            if callee in func_info:
+                ci = func_info[callee]
+                status = ci.get("body_status", "unknown")
+                lines = ci.get("body_lines", 0)
+                loc = ci.get("file", "?")
+                if status == "empty":
+                    annotations.append(f"❌ {callee}() → EMPTY at {loc}")
+                elif status in ("stub_todo", "stub_return"):
+                    annotations.append(f"🔨 {callee}() → STUB at {loc}")
+                elif status == "live" and lines > 0:
+                    annotations.append(f"→ {callee}() [{lines}L] {loc}")
+                elif status == "live_todo":
+                    annotations.append(f"⚠️ {callee}() [TODO] {loc}")
+
+        # ── Return value ──
+        for m in re_return.finditer(stripped):
+            val = m.group(1)
+            if val and val.startswith("-E"):
+                annotations.append(f"↩ return {val}")
+
+        # ── TODO in code ──
+        if re_todo.search(stripped) and "📝" not in str(annotations):
+            annotations.append("📝 TODO")
+
+        line_annotations.append((line_num, raw, annotations))
+
+    # ── Print annotated source ──
+    print()
+    for line_num, raw, annotations in line_annotations:
+        # Trim raw line for display
+        display = raw[:90]
+        if annotations:
+            ann_str = "  ".join(annotations)
+            print(f"  {line_num:>5} │ {display}")
+            print(f"        │   {ann_str}")
+        else:
+            print(f"  {line_num:>5} │ {display}")
+
+    # ── Post-body warnings ──
+    print()
+    if open_locks:
+        for lock_type, lock_line in open_locks:
+            print(f"  ❌ LOCK NOT RELEASED: {lock_type} acquired at L{lock_line}")
+    if alloc_vars:
+        for var, alloc_line in alloc_vars.items():
+            print(f"  ⚠️ ALLOC NOT NULL-CHECKED: {var} allocated at L{alloc_line}")
+    if not open_locks and not alloc_vars:
+        print(f"  ✅ All locks released, all allocations checked")
+    print()
 
 
 def cmd_show(args):

@@ -694,13 +694,23 @@ def _show_full_context(fwd, rev, func, func_info, func_decls, depth):
 
 
 def cmd_diagnose(args):
-    """Full health check on a function — everything the tool knows in one place."""
+    """Full health check — one function or the whole repo."""
     from collections import defaultdict
     import re as _re
     store = load_store(args)
     repo_root = Path(args.repo).resolve()
 
+    # If --all, run repo-wide audit instead of single function
+    if getattr(args, "all", False):
+        _diagnose_all(store, repo_root, args)
+        store.close()
+        return
+
     func = args.function
+    if not func:
+        print("Specify a function name, or use --all for repo-wide audit.")
+        store.close()
+        return
 
     # ── Build indexes ──
     func_info = {}
@@ -941,6 +951,227 @@ def cmd_diagnose(args):
         _audit_source_lines(repo_root, func, info, func_info, fwd)
 
     store.close()
+
+
+def _diagnose_all(store, repo_root: Path, args):
+    """Run line-by-line audit on every function in the repo. Collect all issues."""
+    import re as _re
+    from collections import defaultdict
+
+    func_info = {}
+    for sym in store.find_symbols(kind="function_def", limit=50000):
+        func_info[sym.name] = {
+            "file": sym.file_path, "line": sym.line_start,
+            "body_lines": sym.properties.get("body_lines", 0),
+            "body_status": sym.properties.get("body_status", "unknown"),
+            "has_todo": sym.properties.get("has_todo", False),
+            "signature": sym.properties.get("signature", ""),
+        }
+
+    call_edges = store.get_edges(kind="calls", limit=200000)
+    fwd = defaultdict(list)
+    for edge in call_edges:
+        caller = edge.properties.get("caller", "")
+        callee = edge.properties.get("callee", "")
+        if caller and callee:
+            fwd[caller].append((callee, "", 0))
+
+    # Get profile-relevant dirs
+    relevant_dirs = set()
+    try:
+        _, profile = load_config(args)
+        for pat in (profile.get_kernel_file_patterns() +
+                    profile.get_userspace_file_patterns()):
+            prefix = pat.split("*")[0].rstrip("/")
+            if prefix:
+                relevant_dirs.add(prefix)
+    except Exception:
+        pass
+
+    # Collect all issues across all functions
+    all_issues = []  # [(func, file, line, issue_type, detail)]
+    files_audited = set()
+    funcs_audited = 0
+    funcs_clean = 0
+
+    print(f"Auditing all functions in repo...")
+    print()
+
+    for func_name, info in func_info.items():
+        fp = info.get("file", "")
+        if not fp or not info.get("body_lines"):
+            continue
+        # Filter to relevant paths if profile provided
+        if relevant_dirs and not any(fp.startswith(d) for d in relevant_dirs):
+            continue
+        if fp.endswith(".h"):
+            continue
+
+        file_path = repo_root / fp
+        if not file_path.exists():
+            continue
+
+        funcs_audited += 1
+        func_issues = _audit_function_silent(
+            repo_root, func_name, info, func_info, fwd)
+
+        if func_issues:
+            all_issues.extend(func_issues)
+        else:
+            funcs_clean += 1
+        files_audited.add(fp)
+
+    # ── Summary ──
+    print(f"{'═'*60}")
+    print(f"  REPO-WIDE AUDIT")
+    print(f"{'═'*60}")
+    print(f"  Functions audited: {funcs_audited}")
+    print(f"  Files covered:     {len(files_audited)}")
+    print(f"  Functions clean:   {funcs_clean}")
+    print(f"  Total issues:      {len(all_issues)}")
+    print()
+
+    if not all_issues:
+        print("  ✅ No issues found across all functions.")
+        return
+
+    # Group by issue type
+    by_type = defaultdict(list)
+    for func_name, fp, line, itype, detail in all_issues:
+        by_type[itype].append((func_name, fp, line, detail))
+
+    type_labels = {
+        "empty_callee": "Calls to EMPTY/STUB functions",
+        "lock_not_released": "Locks not released",
+        "alloc_not_checked": "Allocations not NULL-checked",
+        "use_after_free": "Use after free",
+        "unsafe_api": "Unsafe API usage (sprintf/strcpy/strcat)",
+        "unchecked_copy": "Unchecked copy_from_user/copy_to_user",
+        "goto_with_lock": "Goto with locks held",
+        "todo": "TODO/FIXME markers",
+    }
+
+    print(f"  ISSUES BY TYPE:")
+    print(f"  {'─'*56}")
+    for itype, items in sorted(by_type.items(), key=lambda x: -len(x[1])):
+        label = type_labels.get(itype, itype)
+        print(f"\n  {label} ({len(items)}):")
+        for func_name, fp, line, detail in items[:15]:
+            print(f"    {fp}:{line}  {func_name}()  {detail}")
+        if len(items) > 15:
+            print(f"    ... +{len(items) - 15} more")
+
+    print()
+
+
+def _audit_function_silent(repo_root, func_name, info, func_info, fwd):
+    """Audit one function's body silently, return list of issues."""
+    import re as _re
+
+    file_path = repo_root / info["file"]
+    try:
+        with open(file_path, "r", errors="replace") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return []
+
+    start_line = info.get("line", 0)
+    body_lines = info.get("body_lines", 0)
+    if not start_line or not body_lines:
+        return []
+
+    end_line = min(start_line + body_lines + 1, len(all_lines))
+
+    re_call = _re.compile(r'\b([a-zA-Z_]\w{2,})\s*\(')
+    re_alloc = _re.compile(r'(\w+)\s*=\s*(k[mz]alloc|kstrdup|kmemdup|alloc_skb)\s*\(')
+    re_null_check = _re.compile(r'if\s*\(\s*!?\s*(\w+)\s*\)')
+    re_lock = _re.compile(r'(spin_lock|mutex_lock|spin_lock_bh|spin_lock_irq|spin_lock_irqsave)\s*\(')
+    re_unlock = _re.compile(r'(spin_unlock|mutex_unlock|spin_unlock_bh|spin_unlock_irq|spin_unlock_irqrestore)\s*\(')
+    re_goto = _re.compile(r'\bgoto\s+(\w+)\s*;')
+    re_kfree = _re.compile(r'kfree\s*\(\s*(\w+)\s*\)')
+    re_deref = _re.compile(r'(\w+)->(\w+)')
+    re_copy = _re.compile(r'(copy_from_user|copy_to_user)\s*\(')
+    re_sprintf = _re.compile(r'\b(sprintf|strcpy|strcat)\s*\(')
+    re_todo = _re.compile(r'(TODO|FIXME|HACK|XXX|STUB)', _re.IGNORECASE)
+
+    skip = frozenset({
+        "if", "else", "while", "for", "do", "switch", "case", "return",
+        "goto", "sizeof", "typeof", "offsetof", "likely", "unlikely",
+        "WARN", "WARN_ON", "BUG_ON", "IS_ERR", "PTR_ERR", "ERR_PTR",
+        "container_of", "ARRAY_SIZE", "min", "max", "NULL",
+        "pr_err", "pr_info", "pr_warn", "pr_debug", "printk",
+        "IS_ENABLED", "WARN_ON_ONCE", "BUG",
+    })
+
+    issues = []
+    open_locks = []
+    alloc_vars = {}
+    freed_vars = set()
+    fp = info["file"]
+
+    for line_idx in range(start_line - 1, min(end_line, len(all_lines))):
+        line_num = line_idx + 1
+        stripped = all_lines[line_idx].strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
+            if re_todo.search(stripped):
+                issues.append((func_name, fp, line_num, "todo",
+                              stripped[:60]))
+            continue
+
+        for m in re_lock.finditer(stripped):
+            open_locks.append((m.group(1), line_num))
+
+        for m in re_unlock.finditer(stripped):
+            if open_locks:
+                open_locks.pop()
+
+        for m in re_alloc.finditer(stripped):
+            alloc_vars[m.group(1)] = line_num
+
+        for m in re_null_check.finditer(stripped):
+            alloc_vars.pop(m.group(1), None)
+
+        for m in re_kfree.finditer(stripped):
+            freed_vars.add(m.group(1))
+
+        for m in re_deref.finditer(stripped):
+            if m.group(1) in freed_vars:
+                issues.append((func_name, fp, line_num, "use_after_free",
+                              f"{m.group(1)} used after kfree"))
+
+        for m in re_sprintf.finditer(stripped):
+            issues.append((func_name, fp, line_num, "unsafe_api",
+                          m.group(1)))
+
+        for m in re_copy.finditer(stripped):
+            if "=" not in stripped.split(m.group(0))[0]:
+                issues.append((func_name, fp, line_num, "unchecked_copy",
+                              m.group(1)))
+
+        for m in re_goto.finditer(stripped):
+            if open_locks:
+                issues.append((func_name, fp, line_num, "goto_with_lock",
+                              f"goto {m.group(1)} with {len(open_locks)} lock(s)"))
+
+        for m in re_call.finditer(stripped):
+            callee = m.group(1)
+            if callee in skip:
+                continue
+            ci = func_info.get(callee, {})
+            s = ci.get("body_status", "")
+            if s in ("empty", "stub_todo", "stub_return"):
+                issues.append((func_name, fp, line_num, "empty_callee",
+                              f"calls {callee}() [{s}]"))
+
+    # Post-body checks
+    for lock_type, lock_line in open_locks:
+        issues.append((func_name, fp, lock_line, "lock_not_released",
+                      f"{lock_type} never released"))
+    for var, alloc_line in alloc_vars.items():
+        issues.append((func_name, fp, alloc_line, "alloc_not_checked",
+                      f"{var} not NULL-checked"))
+
+    return issues
 
 
 def _audit_source_lines(repo_root: Path, func_name: str, info: dict,
@@ -1337,16 +1568,19 @@ def main():
 
     # diagnose
     p_diag = sub.add_parser("diagnose",
-        help="Full health check on a function",
+        help="Health check — one function or whole repo",
         description=(
-            "Run every check on a single function: reachability, signature\n"
-            "consistency, caller/callee health, lint, stubs, and more.\n\n"
-            "  boundary-mapper diagnose my_function\n"
+            "Line-by-line audit with lock tracking, alloc checking,\n"
+            "callee status, use-after-free detection, and more.\n\n"
+            "  boundary-mapper diagnose my_function   Audit one function\n"
+            "  boundary-mapper diagnose --all         Audit every function in repo\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_diag.add_argument("function",
+    p_diag.add_argument("function", nargs="?", default=None,
                         help="Function name (exact or partial match)")
+    p_diag.add_argument("--all", action="store_true",
+                        help="Audit every function in the repo")
 
     # stats
     sub.add_parser("stats",

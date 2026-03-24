@@ -28,11 +28,42 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
 from . import __version__
+
+
+# ─── Terminal colors ───
+
+def _use_color():
+    """Check if stdout supports color."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not hasattr(sys.stdout, "isatty"):
+        return False
+    return sys.stdout.isatty()
+
+_COLOR = _use_color()
+
+def _c(code: str, text: str) -> str:
+    """Apply ANSI color if terminal supports it."""
+    if not _COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+def RED(t):     return _c("91", t)
+def GREEN(t):   return _c("92", t)
+def YELLOW(t):  return _c("93", t)
+def BLUE(t):    return _c("94", t)
+def CYAN(t):    return _c("96", t)
+def DIM(t):     return _c("2", t)
+def BOLD(t):    return _c("1", t)
+def BRED(t):    return _c("1;91", t)
+def BGREEN(t):  return _c("1;92", t)
+def BYELLOW(t): return _c("1;93", t)
 from .config import (
     AnalysisConfig, CONFIG_FILENAME, generate_config_template,
     generate_claude_skill,
@@ -471,14 +502,23 @@ _STATUS_ICONS = {
 }
 
 def _status_tag(info: dict) -> str:
-    """Generate a status tag like [LIVE 45 lines] or [STUB TODO 3 lines]."""
+    """Generate a colored status tag."""
     if not info:
-        return "[❌ MISSING]"
+        return RED("[❌ MISSING]")
     status = info.get("body_status", "unknown")
     lines = info.get("body_lines", 0)
     icon = _STATUS_ICONS.get(status, "❓")
     label = status.upper().replace("_", " ")
-    return f"[{icon} {label} {lines}L]" if lines else f"[{icon} {label}]"
+    tag = f"[{icon} {label} {lines}L]" if lines else f"[{icon} {label}]"
+    if status in ("live",):
+        return GREEN(tag)
+    if status in ("live_todo",):
+        return YELLOW(tag)
+    if status in ("stub_todo", "stub_return"):
+        return YELLOW(tag)
+    if status in ("empty", "missing", "unknown"):
+        return RED(tag)
+    return tag
 
 
 def _func_location(info: dict) -> str:
@@ -904,17 +944,17 @@ def cmd_diagnose(args):
     print(f"  {'─'*56}")
 
     if issues:
-        print(f"\n  ❌ ISSUES ({len(issues)}):")
+        print(f"\n  {BRED('❌ ISSUES')} ({len(issues)}):")
         for i in issues:
-            print(f"    • {i}")
+            print(f"    {RED('•')} {RED(i)}")
 
     if warnings:
-        print(f"\n  ⚠️  WARNINGS ({len(warnings)}):")
+        print(f"\n  {BYELLOW('⚠️  WARNINGS')} ({len(warnings)}):")
         for w in warnings:
-            print(f"    • {w}")
+            print(f"    {YELLOW('•')} {YELLOW(w)}")
 
     if good:
-        print(f"\n  ✅ HEALTHY ({len(good)}):")
+        print(f"\n  {BGREEN('✅ HEALTHY')} ({len(good)}):")
         for g in good:
             print(f"    • {g}")
 
@@ -939,11 +979,11 @@ def cmd_diagnose(args):
     # ── Verdict ──
     print(f"\n  {'─'*56}")
     if issues:
-        print(f"  VERDICT: ❌ {len(issues)} issue(s) found — needs attention")
+        print(f"  {BRED('VERDICT: ❌')} {RED(f'{len(issues)} issue(s) found — needs attention')}")
     elif warnings:
-        print(f"  VERDICT: ⚠️  Functional but {len(warnings)} warning(s)")
+        print(f"  {BYELLOW('VERDICT: ⚠️')}  {YELLOW(f'Functional but {len(warnings)} warning(s)')}")
     else:
-        print(f"  VERDICT: ✅ HEALTHY — no issues detected")
+        print(f"  {BGREEN('VERDICT: ✅ HEALTHY')} — {GREEN('no issues detected')}")
     print()
 
     # ── Line-by-line source audit ──
@@ -1237,76 +1277,80 @@ def _audit_source_lines(repo_root: Path, func_name: str, info: dict,
         line_num = line_idx + 1
         raw = all_lines[line_idx].rstrip("\n")
         stripped = raw.strip()
-        annotations = []
+        annotations = []  # list of (color_fn, text)
+        has_error = False
 
         # Skip empty/comment lines
         if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
             if re_todo.search(stripped):
-                annotations.append("📝 TODO")
-            line_annotations.append((line_num, raw, annotations))
+                annotations.append((YELLOW, "📝 TODO"))
+            line_annotations.append((line_num, raw, annotations, False))
             continue
 
         # ── Lock tracking ──
         for m in re_lock.finditer(stripped):
             lock_type = m.group(1)
             open_locks.append((lock_type, line_num))
-            annotations.append(f"🔒 {lock_type}")
+            annotations.append((CYAN, f"🔒 {lock_type}"))
 
         for m in re_unlock.finditer(stripped):
             unlock_type = m.group(1)
             if open_locks:
                 lock_type, lock_line = open_locks.pop()
-                annotations.append(f"🔓 {unlock_type} (matches L{lock_line})")
+                annotations.append((GREEN, f"🔓 {unlock_type} (matches L{lock_line})"))
             else:
-                annotations.append(f"⚠️ {unlock_type} — no matching lock!")
+                annotations.append((RED, f"⚠️ {unlock_type} — no matching lock!"))
+                has_error = True
 
         # ── Allocation tracking ──
         for m in re_alloc.finditer(stripped):
             var = m.group(1)
             alloc_fn = m.group(2)
             alloc_vars[var] = line_num
-            annotations.append(f"📦 {alloc_fn} → {var}")
+            annotations.append((CYAN, f"📦 {alloc_fn} → {var}"))
 
         # ── NULL check clears allocation warning ──
         for m in re_null_check.finditer(stripped):
             var = m.group(1)
             if var in alloc_vars:
-                annotations.append(f"✅ NULL check on {var} (alloc L{alloc_vars[var]})")
+                annotations.append((GREEN, f"✅ NULL check on {var} (alloc L{alloc_vars[var]})"))
                 del alloc_vars[var]
 
         # ── kfree tracking ──
         for m in re_kfree.finditer(stripped):
             var = m.group(1)
             freed_vars.add(var)
-            annotations.append(f"🗑️ kfree({var})")
+            annotations.append((YELLOW, f"🗑️ kfree({var})"))
 
         # ── Use after free ──
         for m in re_deref.finditer(stripped):
             var = m.group(1)
             if var in freed_vars:
-                annotations.append(f"❌ USE AFTER FREE: {var} was freed")
+                annotations.append((RED, f"❌ USE AFTER FREE: {var} was freed"))
+                has_error = True
 
         # ── Unsafe functions ──
         for m in re_sprintf.finditer(stripped):
-            annotations.append(f"⚠️ {m.group(1)} — no bounds check")
+            annotations.append((YELLOW, f"⚠️ {m.group(1)} — no bounds check"))
 
         for m in re_copy.finditer(stripped):
-            # Check if return value is checked (= copy_from_user on same line)
             if "=" not in stripped.split(m.group(0))[0]:
-                annotations.append(f"⚠️ {m.group(1)} return not checked")
+                annotations.append((RED, f"⚠️ {m.group(1)} return not checked"))
+                has_error = True
 
         # ── goto ──
         for m in re_goto.finditer(stripped):
             label = m.group(1)
             if open_locks:
-                annotations.append(f"↪ goto {label} — {len(open_locks)} lock(s) held!")
+                annotations.append((RED, f"↪ goto {label} — {len(open_locks)} lock(s) held!"))
+                has_error = True
             else:
-                annotations.append(f"↪ goto {label}")
+                annotations.append((DIM, f"↪ goto {label}"))
 
         # ── Labels ──
         for m in re_label.finditer(stripped):
             if m.group(1) not in ("default", "case"):
-                annotations.append(f"🏷️ label {m.group(1)}")
+                annotations.append((DIM, f"🏷️ label {m.group(1)}"))
 
         # ── Function calls — look up every callee ──
         for m in re_call.finditer(stripped):
@@ -1319,46 +1363,49 @@ def _audit_source_lines(repo_root: Path, func_name: str, info: dict,
                 lines = ci.get("body_lines", 0)
                 loc = ci.get("file", "?")
                 if status == "empty":
-                    annotations.append(f"❌ {callee}() → EMPTY at {loc}")
+                    annotations.append((RED, f"❌ {callee}() → EMPTY at {loc}"))
+                    has_error = True
                 elif status in ("stub_todo", "stub_return"):
-                    annotations.append(f"🔨 {callee}() → STUB at {loc}")
+                    annotations.append((YELLOW, f"🔨 {callee}() → STUB at {loc}"))
                 elif status == "live" and lines > 0:
-                    annotations.append(f"→ {callee}() [{lines}L] {loc}")
+                    annotations.append((GREEN, f"→ {callee}() [{lines}L] {loc}"))
                 elif status == "live_todo":
-                    annotations.append(f"⚠️ {callee}() [TODO] {loc}")
+                    annotations.append((YELLOW, f"⚠️ {callee}() [TODO] {loc}"))
 
         # ── Return value ──
         for m in re_return.finditer(stripped):
             val = m.group(1)
             if val and val.startswith("-E"):
-                annotations.append(f"↩ return {val}")
+                annotations.append((CYAN, f"↩ return {val}"))
 
         # ── TODO in code ──
-        if re_todo.search(stripped) and "📝" not in str(annotations):
-            annotations.append("📝 TODO")
+        if re_todo.search(stripped) and not any("📝" in a[1] for a in annotations):
+            annotations.append((YELLOW, "📝 TODO"))
 
-        line_annotations.append((line_num, raw, annotations))
+        line_annotations.append((line_num, raw, annotations, has_error))
 
     # ── Print annotated source ──
     print()
-    for line_num, raw, annotations in line_annotations:
-        # Trim raw line for display
+    for line_num, raw, annotations, has_err in line_annotations:
         display = raw[:90]
+        line_color = RED if has_err else (lambda x: x)
+        num_str = DIM(f"{line_num:>5}")
         if annotations:
-            ann_str = "  ".join(annotations)
-            print(f"  {line_num:>5} │ {display}")
-            print(f"        │   {ann_str}")
+            ann_parts = [color_fn(text) for color_fn, text in annotations]
+            ann_str = "  ".join(ann_parts)
+            print(f"  {num_str} │ {line_color(display)}")
+            print(f"  {DIM('     ')} │   {ann_str}")
         else:
-            print(f"  {line_num:>5} │ {display}")
+            print(f"  {num_str} │ {display}")
 
     # ── Post-body warnings ──
     print()
     if open_locks:
         for lock_type, lock_line in open_locks:
-            print(f"  ❌ LOCK NOT RELEASED: {lock_type} acquired at L{lock_line}")
+            print(f"  {BRED('❌ LOCK NOT RELEASED:')} {RED(f'{lock_type} acquired at L{lock_line}')}")
     if alloc_vars:
         for var, alloc_line in alloc_vars.items():
-            print(f"  ⚠️ ALLOC NOT NULL-CHECKED: {var} allocated at L{alloc_line}")
+            print(f"  {BYELLOW('⚠️ ALLOC NOT NULL-CHECKED:')} {YELLOW(f'{var} allocated at L{alloc_line}')}")
     if not open_locks and not alloc_vars:
         print(f"  ✅ All locks released, all allocations checked")
     print()

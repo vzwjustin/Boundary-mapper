@@ -29,6 +29,7 @@ from boundary_mapper.models import (
 from boundary_mapper.pattern_extract import ExtractedFile, PatternExtractor
 from boundary_mapper.repo_scan import ScannedFile
 from boundary_mapper.rules_engine import (
+    AttributeSymmetryRule, ContractDriftRule,
     DeadSurfaceRule, MissingHandlerRule, SockoptCompleteness,
 )
 
@@ -216,25 +217,12 @@ class TestSockoptSurfaceBuilding(unittest.TestCase):
 class TestDeadSurfaceRule(unittest.TestCase):
     """DeadSurfaceRule should detect surfaces with no handler or producer."""
 
-    def test_declared_surface_flagged_as_dead(self):
-        store = _make_store()
-        profile = _TestProfile()
+    def test_future_reserved_suppressed_entirely(self):
+        """Future-reserved surfaces should NOT appear in findings at all.
 
-        # Build surfaces — MYMOD_FUTURE_OPT has no dispatch
-        gb = GraphBuilder(store, profile)
-        gb.build_boundary_surfaces(None)
-
-        rule = DeadSurfaceRule()
-        findings = rule.evaluate(store, profile)
-
-        dead_names = [f.title for f in findings if "Dead surface" in f.title]
-        future_dead = [f for f in dead_names if "MYMOD_FUTURE_OPT" in f]
-        self.assertGreater(
-            len(future_dead), 0,
-            "Undispatched sockopt should be flagged as dead surface"
-        )
-
-    def test_future_reserved_downgraded_to_low(self):
+        The old behavior was to downgrade to LOW severity — but that still
+        creates noise.  The new behavior is to suppress entirely.
+        """
         store = _make_store()
         profile = _TestProfile()
 
@@ -247,12 +235,30 @@ class TestDeadSurfaceRule(unittest.TestCase):
         future_findings = [
             f for f in findings if "MYMOD_FUTURE_OPT" in f.title
         ]
-        for f in future_findings:
-            if "Dead surface" in f.title:
-                self.assertEqual(
-                    f.severity, FindingSeverity.LOW,
-                    "Future-reserved surface should be LOW severity"
-                )
+        self.assertEqual(
+            len(future_findings), 0,
+            "Future-reserved surface should be suppressed entirely"
+        )
+
+    def test_unknown_undispatched_flagged_as_dead(self):
+        """Undispatched surface that is NOT future-reserved should be flagged."""
+        store = _make_store()
+        profile = _TestProfile()
+
+        gb = GraphBuilder(store, profile)
+        gb.build_boundary_surfaces(None)
+
+        rule = DeadSurfaceRule()
+        findings = rule.evaluate(store, profile)
+
+        # MYMOD_NODELAY, MYMOD_CC_ALGO, MYMOD_KEEPALIVE are not future-reserved
+        # and have no dispatch → should be flagged as dead
+        dead_names = [f.title for f in findings if "Dead surface" in f.title]
+        non_future = [t for t in dead_names if "MYMOD_FUTURE_OPT" not in t]
+        self.assertGreater(
+            len(non_future), 0,
+            "Non-future undispatched sockopt should be flagged as dead"
+        )
 
     def test_dispatched_surface_not_flagged_as_dead(self):
         store = _make_store()
@@ -363,7 +369,11 @@ class TestSockoptCompleteness(unittest.TestCase):
             "Dispatched sockopt should NOT be flagged"
         )
 
-    def test_future_reserved_gets_low_severity(self):
+    def test_future_reserved_suppressed_entirely(self):
+        """Future-reserved sockopts should NOT appear in completeness findings.
+
+        The old behavior was to emit at LOW severity — but that's still noise.
+        """
         store = _make_store()
         profile = _TestProfile()
 
@@ -371,8 +381,10 @@ class TestSockoptCompleteness(unittest.TestCase):
         findings = rule.evaluate(store, profile)
 
         future = [f for f in findings if "MYMOD_FUTURE_OPT" in f.title]
-        self.assertGreater(len(future), 0)
-        self.assertEqual(future[0].severity, FindingSeverity.LOW)
+        self.assertEqual(
+            len(future), 0,
+            "Future-reserved sockopt should be suppressed entirely"
+        )
 
     def test_all_dispatched_produces_no_findings(self):
         store = _make_store()
@@ -555,9 +567,18 @@ class TestEndToEndWiring(unittest.TestCase):
         nodelay_findings = [f for f in findings if "MYMOD_NODELAY" in f.title]
         self.assertEqual(len(nodelay_findings), 0)
 
-        # FUTURE_OPT is dead — should be in findings
+        # FUTURE_OPT is future-reserved — should be SUPPRESSED entirely
         future_findings = [f for f in findings if "MYMOD_FUTURE_OPT" in f.title]
-        self.assertGreater(len(future_findings), 0)
+        self.assertEqual(len(future_findings), 0,
+                         "Future-reserved surface should be suppressed")
+
+        # But CC_ALGO and KEEPALIVE are NOT future-reserved and have no
+        # dispatch → should be flagged as dead
+        other_dead = [f for f in findings
+                      if "Dead surface" in f.title
+                      and "MYMOD_FUTURE_OPT" not in f.title]
+        self.assertGreater(len(other_dead), 0,
+                           "Non-future undispatched sockopts should be flagged")
 
 
 # ── Profile without sockopt map ──────────────────────────────────
@@ -591,6 +612,153 @@ class TestNoSockoptMap(unittest.TestCase):
         rule = SockoptCompleteness()
         findings = rule.evaluate(store, MinimalProfile())
         self.assertEqual(len(findings), 0)
+
+
+# ── False-positive suppression tests ─────────────────────────────
+
+
+class TestMissingHandlerFalsePositives(unittest.TestCase):
+    """MissingHandlerRule should not match short command stems."""
+
+    def test_short_stem_suppressed(self):
+        """MYMOD_CMD_GET has stem 'get' (3 chars) — too short to match."""
+        store = _make_store()
+        profile = _TestProfile()
+        _add_userspace_ref(store, "MYMOD_CMD_GET")
+
+        rule = MissingHandlerRule()
+        findings = rule.evaluate(store, profile)
+
+        get_findings = [f for f in findings if "MYMOD_CMD_GET" in f.title]
+        self.assertEqual(
+            len(get_findings), 0,
+            "Short stems like 'get' should be suppressed"
+        )
+
+    def test_long_stem_still_flagged(self):
+        """MYMOD_CMD_CONNECT has stem 'connect' (7 chars) — should be flagged."""
+        store = _make_store()
+        profile = _TestProfile()
+        _add_userspace_ref(store, "MYMOD_CMD_CONNECT")
+
+        rule = MissingHandlerRule()
+        findings = rule.evaluate(store, profile)
+
+        connect_findings = [f for f in findings if "MYMOD_CMD_CONNECT" in f.title]
+        self.assertGreater(
+            len(connect_findings), 0,
+            "Long stem without handler should still be flagged"
+        )
+
+    def test_dispatched_command_not_flagged(self):
+        """Command with kernel dispatch entry should never be flagged."""
+        store = _make_store()
+        profile = _TestProfile()
+        _add_userspace_ref(store, "MYMOD_CMD_CONNECT")
+        _add_kernel_dispatch(store, "MYMOD_CMD_CONNECT")
+
+        rule = MissingHandlerRule()
+        findings = rule.evaluate(store, profile)
+
+        connect_findings = [f for f in findings if "MYMOD_CMD_CONNECT" in f.title]
+        self.assertEqual(
+            len(connect_findings), 0,
+            "Dispatched command should not be flagged"
+        )
+
+    def test_word_boundary_matching(self):
+        """Stem 'connect' should match 'mymod_nl_cmd_connect' but not
+        'mymod_reconnect_timer'."""
+        store = _make_store()
+        profile = _TestProfile()
+        _add_userspace_ref(store, "MYMOD_CMD_CONNECT")
+
+        # Add a kernel function that DOES match on word boundary
+        store.upsert_symbol(SymbolNode(
+            name="mymod_nl_cmd_connect",
+            kind=SymbolKind.FUNCTION_DEF,
+            side=Side.KERNEL,
+            file_path="src/netlink.c",
+            line_start=100,
+        ))
+
+        rule = MissingHandlerRule()
+        findings = rule.evaluate(store, profile)
+
+        connect_findings = [f for f in findings if "MYMOD_CMD_CONNECT" in f.title]
+        self.assertEqual(len(connect_findings), 0,
+                         "Word-boundary match should suppress finding")
+
+
+class TestContractDriftSuppression(unittest.TestCase):
+    """ContractDriftRule should suppress common sentinel suffixes."""
+
+    def _make_shared_const(self, store, name):
+        store.upsert_symbol(SymbolNode(
+            name=name,
+            kind=SymbolKind.CONSTANT,
+            side=Side.SHARED,
+            file_path="include/uapi/mymod.h",
+            line_start=1,
+        ))
+
+    def test_max_suffix_suppressed(self):
+        store = _make_store()
+        profile = _TestProfile()
+        self._make_shared_const(store, "MYMOD_OPT_MAX")
+
+        rule = ContractDriftRule()
+        findings = rule.evaluate(store, profile)
+
+        max_findings = [f for f in findings if "MYMOD_OPT_MAX" in f.title]
+        self.assertEqual(len(max_findings), 0,
+                         "_MAX suffix should be suppressed")
+
+    def test_unspec_suffix_suppressed(self):
+        store = _make_store()
+        profile = _TestProfile()
+        self._make_shared_const(store, "MYMOD_UNSPEC")
+
+        rule = ContractDriftRule()
+        findings = rule.evaluate(store, profile)
+
+        unspec_findings = [f for f in findings if "MYMOD_UNSPEC" in f.title]
+        self.assertEqual(len(unspec_findings), 0,
+                         "_UNSPEC suffix should be suppressed")
+
+    def test_real_unused_still_flagged(self):
+        store = _make_store()
+        profile = _TestProfile()
+        self._make_shared_const(store, "MYMOD_SOME_FEATURE")
+
+        rule = ContractDriftRule()
+        findings = rule.evaluate(store, profile)
+
+        feature_findings = [f for f in findings if "MYMOD_SOME_FEATURE" in f.title]
+        self.assertGreater(len(feature_findings), 0,
+                           "Real unused UAPI constant should still be flagged")
+
+
+class TestAttributeSymmetrySuppression(unittest.TestCase):
+    """AttributeSymmetryRule should suppress sentinel attributes."""
+
+    def test_pad_suppressed(self):
+        store = _make_store()
+        profile = _TestProfile()
+        store.upsert_symbol(SymbolNode(
+            name="MYMOD_ATTR_PAD",
+            kind=SymbolKind.ENUM_VALUE,
+            side=Side.SHARED,
+            file_path="include/uapi/mymod.h",
+            line_start=1,
+        ))
+
+        rule = AttributeSymmetryRule()
+        findings = rule.evaluate(store, profile)
+
+        pad_findings = [f for f in findings if "MYMOD_ATTR_PAD" in f.title]
+        self.assertEqual(len(pad_findings), 0,
+                         "_PAD attribute should be suppressed")
 
 
 if __name__ == "__main__":

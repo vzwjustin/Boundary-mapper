@@ -340,5 +340,128 @@ int complex(int x) {
         self.assertIn("return 0", chunks[0][1])
 
 
+# ── New: extended guard suppression ──────────────────────────────
+
+
+class TestGotoErrSuppression(unittest.TestCase):
+    """Alloc followed by goto err_free should be suppressed."""
+
+    def test_goto_err_suppressed(self):
+        src = """\
+int mymod_setup(void) {
+    struct foo *p;
+    p = kzalloc(sizeof(*p), GFP_KERNEL);
+    if (!p)
+        goto err_free;
+    return 0;
+err_free:
+    return -ENOMEM;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        alloc_hits = [h for h in hits if h["category"] == "unchecked_alloc"]
+        self.assertEqual(len(alloc_hits), 0,
+                         "goto err_free after alloc should suppress finding")
+
+    def test_return_enomem_suppressed(self):
+        src = """\
+int mymod_setup(void) {
+    struct foo *p;
+    p = kmalloc(64, GFP_KERNEL);
+    if (!p)
+        return -ENOMEM;
+    return 0;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        alloc_hits = [h for h in hits if h["category"] == "unchecked_alloc"]
+        self.assertEqual(len(alloc_hits), 0,
+                         "return -ENOMEM after alloc should suppress finding")
+
+
+class TestConstantSizeKmalloc(unittest.TestCase):
+    """kmalloc with constant-sized names should not be flagged."""
+
+    def test_max_len_constant_suppressed(self):
+        src = """\
+void mymod_alloc(void) {
+    buf = kmalloc(MAX_LEN, GFP_KERNEL);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertEqual(len(size_hits), 0,
+                         "ALL_CAPS constant should be suppressed")
+
+    def test_suffix_size_suppressed(self):
+        src = """\
+void mymod_alloc(void) {
+    buf = kmalloc(msg_len, GFP_KERNEL);
+}
+"""
+        # msg_len is not ALL_CAPS, doesn't end with _SIZE/_MAX — should flag
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertGreater(len(size_hits), 0,
+                           "Lowercase variable name should still flag")
+
+    def test_buf_SIZE_suffix_suppressed(self):
+        src = """\
+void mymod_alloc(void) {
+    buf = kmalloc(buf_LEN, GFP_KERNEL);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        size_hits = [h for h in hits if h["name"] == "user_size_to_kmalloc"]
+        self.assertEqual(len(size_hits), 0,
+                         "_LEN suffix should be suppressed")
+
+
+class TestCopyFromUserSuppression(unittest.TestCase):
+    """copy_from_user return value used in condition or assigned."""
+
+    def test_return_value_assigned(self):
+        src = """\
+int mymod_read(void) {
+    ret = copy_from_user(dst, src, len);
+    if (ret)
+        return -EFAULT;
+    return 0;
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        copy_hits = [h for h in hits if h["name"] == "unchecked_copy_from_user"]
+        self.assertEqual(len(copy_hits), 0,
+                         "copy_from_user with ret= should be suppressed")
+
+    def test_return_propagated(self):
+        src = """\
+int mymod_read(void) {
+    return copy_from_user(dst, src, len);
+}
+"""
+        hits = _extract_lint_hits(src, "c")
+        copy_hits = [h for h in hits if h["name"] == "unchecked_copy_from_user"]
+        self.assertEqual(len(copy_hits), 0,
+                         "return copy_from_user should be suppressed")
+
+
+def _extract_lint_hits(src, ext):
+    """Helper: run lint extraction and return hits."""
+    pe = PatternExtractor(_EmptyProfile())
+    sf = ScannedFile(
+        rel_path=f"test_file.{ext}",
+        abs_path=f"/tmp/test_file.{ext}",
+        side=Side.KERNEL,
+        language=ext,
+        size_bytes=len(src),
+    )
+    from boundary_mapper.pattern_extract import ExtractedFile
+    result = ExtractedFile(sf.rel_path)
+    lang = LANG_C if ext == "c" else LANG_GO
+    pe._extract_lint(src, sf, result, lang, ext)
+    return result.lint_hits
+
+
 if __name__ == "__main__":
     unittest.main()

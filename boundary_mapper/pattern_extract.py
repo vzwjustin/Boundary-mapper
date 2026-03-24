@@ -657,20 +657,36 @@ class PatternExtractor:
             (re.compile(r'if\s*\(\s*unlikely\s*\(\s*!{var}\s*\)\s*\)'), "after"),
             # ptr = NULL or ptr = ERR_PTR (reassignment, not original alloc)
             (re.compile(r'{var}\s*=\s*(?:NULL|ERR_PTR)'), "after"),
+            # return PTR_ERR / return -ENOMEM after alloc
+            (re.compile(r'return\s+(?:PTR_ERR|-ENOMEM)'), "after"),
+            # goto err / goto out pattern (error cleanup path)
+            (re.compile(r'goto\s+\w*(?:err|fail|out|cleanup|free)\w*'), "after"),
+            # if (ptr) { ... } — guarded usage
+            (re.compile(r'if\s*\(\s*{var}\s*\)'), "after"),
+            # ternary guard: ptr ? use : default
+            (re.compile(r'{var}\s*\?\s*'), "after"),
         ],
         "unsafe_copy": [
             # if (copy_from_user(...)) — call used as condition
             (re.compile(r'if\s*\(\s*copy_(?:from|to)_user\b'), "match_line"),
             # ret = copy_from_user(...) — return value captured
             (re.compile(r'\w+\s*=\s*copy_(?:from|to)_user\b'), "match_line"),
+            # return copy_from_user(...) — return value propagated
+            (re.compile(r'return\s+copy_(?:from|to)_user\b'), "match_line"),
         ],
         "use_after_free": [
             # ptr = NULL after kfree
             (re.compile(r'{var}\s*=\s*NULL\s*;'), "after"),
+            # Variable reassigned to new value
+            (re.compile(r'{var}\s*=\s*(?!NULL)\w'), "after"),
+            # kfree at end of function / before return
+            (re.compile(r'return\b'), "after"),
         ],
         "deadlock": [
             # spin_unlock / mutex_unlock between the two lock calls
             (re.compile(r'(?:spin_unlock|mutex_unlock|read_unlock|write_unlock)'), "around"),
+            # rcu_read_unlock between locks
+            (re.compile(r'rcu_read_unlock'), "around"),
         ],
         "integer_overflow": [
             # Size check before kmalloc: if (len > MAX) / clamp / min
@@ -678,6 +694,14 @@ class PatternExtractor:
             (re.compile(r'min\s*\('), "before"),
             (re.compile(r'clamp\s*\('), "before"),
             (re.compile(r'check_mul_overflow'), "before"),
+            # array_size / struct_size helpers (overflow-safe)
+            (re.compile(r'(?:array_size|struct_size|size_mul|size_add)\s*\('), "match_line"),
+        ],
+        "buffer_overflow": [
+            # snprintf already safe — suppress if nearby
+            (re.compile(r'snprintf\s*\('), "around"),
+            # sizeof in same expression
+            (re.compile(r'sizeof\s*\('), "match_line"),
         ],
     }
 
@@ -694,9 +718,10 @@ class PatternExtractor:
         except (IndexError, AttributeError):
             var_name = None
 
-        # Pre-compute context regions
-        before_start = max(0, match_line - 3)
-        after_end = min(match_line + 4, len(lines))
+        # Pre-compute context regions (±5 lines to catch guards that are
+        # a few lines away from the flagged pattern)
+        before_start = max(0, match_line - 5)
+        after_end = min(match_line + 6, len(lines))
         before_text = "\n".join(lines[before_start:match_line])
         match_text = lines[match_line] if match_line < len(lines) else ""
         after_text = "\n".join(lines[match_line + 1:after_end])
@@ -769,7 +794,7 @@ class PatternExtractor:
                     '\\\\' + str(i), re.escape(m.group(i)))
             except IndexError:
                 break
-        lookahead = content[m.end():m.end() + 300]
+        lookahead = content[m.end():m.end() + 800]
         try:
             if re.search(suppress_re, lookahead):
                 return True
@@ -910,6 +935,15 @@ class PatternExtractor:
                     size_match = re.search(r'kmalloc\s*\(\s*(\w+)', m.group(0))
                     if size_match:
                         var = size_match.group(1)
+
+                        # Skip constant-size names — these are compile-time
+                        # constants, not user-controlled sizes.
+                        if (var.isupper() or
+                                var.startswith(("MAX_", "MIN_", "sizeof")) or
+                                var.endswith(("_SIZE", "_LEN", "_MAX",
+                                              "_LIMIT", "_CAP"))):
+                            continue
+
                         lookbehind = content[max(0, m.start() - 500):m.start()]
                         bounds_patterns = [
                             rf'if\s*\(\s*{re.escape(var)}\s*[>!]',

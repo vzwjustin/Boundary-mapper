@@ -199,11 +199,16 @@ class FactStore:
 
     def find_symbols(self, name: str = "", kind: str = "",
                      side: str = "", file_path: str = "",
-                     limit: int = 100) -> list[SymbolNode]:
+                     limit: int = 100,
+                     exact_name: bool = False) -> list[SymbolNode]:
         clauses, params = [], []
         if name:
-            clauses.append("name LIKE ?")
-            params.append(f"%{name}%")
+            if exact_name:
+                clauses.append("name = ?")
+                params.append(name)
+            else:
+                clauses.append("name LIKE ?")
+                params.append(f"%{name}%")
         if kind:
             clauses.append("kind = ?")
             params.append(kind)
@@ -398,8 +403,19 @@ class FactStore:
             clauses.append("category = ?")
             params.append(category)
         where = " AND ".join(clauses) if clauses else "1=1"
+        # Sort by severity so HIGH findings are never truncated by limit.
+        # CASE maps to: critical=0, high=1, medium=2, low=3, info=4.
         rows = self.conn.execute(
-            f"SELECT * FROM findings WHERE {where} LIMIT ?",
+            f"""SELECT * FROM findings WHERE {where}
+                ORDER BY CASE severity
+                    WHEN 'critical' THEN 0
+                    WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2
+                    WHEN 'low' THEN 3
+                    WHEN 'info' THEN 4
+                    ELSE 5
+                END
+                LIMIT ?""",
             (*params, limit),
         ).fetchall()
         return [self._row_to_finding(r) for r in rows]

@@ -553,12 +553,17 @@ LANG_GO = LanguageDef(
         ),
         LintPattern(
             name="defer_in_loop",
-            regex=r'for\s+.*\{[^}]*defer\b',
+            # Match only actual Go for-loop statements (must start at
+            # beginning of line, optionally indented), not prose or
+            # comments containing "for".  The loop body must contain
+            # a defer statement on its own line.
+            regex=r'^\s*for\s+[^/\n]*\{[^}]*\n\s*defer\b',
             severity="medium",
             category="resource_leak",
             message="defer inside loop — defers don't run until function returns",
             recommendation="move_defer_or_use_closure",
             multiline=True,
+            only_in="go",
         ),
         LintPattern(
             name="fmt_errorf_wrap",

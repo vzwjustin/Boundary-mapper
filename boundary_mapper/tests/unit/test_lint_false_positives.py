@@ -695,5 +695,162 @@ class _ProfileWithMismatchedPrefixes:
         return ["MYMOD_ATTR_"]
 
 
+# ── Test file exclusion ──────────────────────────────────────────
+
+
+class TestTestFileExclusion(unittest.TestCase):
+    """Lint should skip security categories in test files."""
+
+    def test_test_go_unchecked_error_skipped(self):
+        """_test.go files should not flag unchecked errors."""
+        src = """\
+func TestMyFunc(t *testing.T) {
+    err := doSomething()
+    assert.NoError(t, err)
+}
+"""
+        pe = PatternExtractor(_EmptyProfile())
+        sf = ScannedFile(
+            rel_path="pkg/mymod/handler_test.go",
+            abs_path="/tmp/handler_test.go",
+            side=Side.USERSPACE,
+            language="go",
+            size_bytes=len(src),
+        )
+        from boundary_mapper.pattern_extract import ExtractedFile
+        result = ExtractedFile(sf.rel_path)
+        from boundary_mapper.languages import LANG_GO
+        pe._extract_lint(src, sf, result, LANG_GO, "go")
+
+        error_hits = [h for h in result.lint_hits
+                      if h["category"] == "unchecked_error"]
+        self.assertEqual(len(error_hits), 0,
+                         "_test.go should skip unchecked_error")
+
+    def test_non_test_go_unchecked_error_flagged(self):
+        """Regular .go files should still flag unchecked errors."""
+        src = """\
+func MyFunc() {
+    err := doSomething()
+    fmt.Println("done")
+}
+"""
+        pe = PatternExtractor(_EmptyProfile())
+        sf = ScannedFile(
+            rel_path="pkg/mymod/handler.go",
+            abs_path="/tmp/handler.go",
+            side=Side.USERSPACE,
+            language="go",
+            size_bytes=len(src),
+        )
+        from boundary_mapper.pattern_extract import ExtractedFile
+        result = ExtractedFile(sf.rel_path)
+        from boundary_mapper.languages import LANG_GO
+        pe._extract_lint(src, sf, result, LANG_GO, "go")
+
+        error_hits = [h for h in result.lint_hits
+                      if h["category"] == "unchecked_error"]
+        self.assertGreater(len(error_hits), 0,
+                           "Regular .go files should flag unchecked_error")
+
+
+# ── Hardcoded IP severity ───────────────────────────────────────
+
+
+class TestHardcodedIPSeverity(unittest.TestCase):
+    """Loopback and bind-all IPs should be INFO, not MEDIUM."""
+
+    def test_loopback_is_info(self):
+        src = 'char *addr = "127.0.0.1";\n'
+        hits = _extract_lint_hits(src, "c")
+        ip_hits = [h for h in hits if h["name"] == "hardcoded_ip"]
+        self.assertGreater(len(ip_hits), 0)
+        self.assertEqual(ip_hits[0]["severity"], "info",
+                         "127.0.0.1 should be INFO severity")
+
+    def test_bind_all_is_info(self):
+        src = 'char *listen = "0.0.0.0";\n'
+        hits = _extract_lint_hits(src, "c")
+        ip_hits = [h for h in hits if h["name"] == "hardcoded_ip"]
+        self.assertGreater(len(ip_hits), 0)
+        self.assertEqual(ip_hits[0]["severity"], "info",
+                         "0.0.0.0 should be INFO severity")
+
+    def test_real_ip_stays_medium(self):
+        src = 'char *server = "10.0.1.5";\n'
+        hits = _extract_lint_hits(src, "c")
+        ip_hits = [h for h in hits if h["name"] == "hardcoded_ip"]
+        self.assertGreater(len(ip_hits), 0)
+        self.assertEqual(ip_hits[0]["severity"], "medium",
+                         "Real IP should stay MEDIUM")
+
+
+# ── defer_in_loop precision ─────────────────────────────────────
+
+
+class TestDeferInLoopPrecision(unittest.TestCase):
+    """defer_in_loop should only match actual Go for-loops, not prose."""
+
+    def test_actual_defer_in_loop_flagged(self):
+        src = """\
+func leaky() {
+    for i := 0; i < 10; i++ {
+        defer cleanup()
+    }
+}
+"""
+        hits = _extract_lint_hits(src, "go")
+        defer_hits = [h for h in hits if h["name"] == "defer_in_loop"]
+        self.assertGreater(len(defer_hits), 0,
+                           "Actual defer in for-loop should be flagged")
+
+    def test_comment_with_for_not_flagged(self):
+        """Comment containing 'for' should not trigger defer_in_loop."""
+        src = """\
+// This struct is used for connection tracking.
+// Each entry has a defer callback registered.
+type ConnTracker struct {
+    entries map[string]*Entry
+}
+"""
+        hits = _extract_lint_hits(src, "go")
+        defer_hits = [h for h in hits if h["name"] == "defer_in_loop"]
+        self.assertEqual(len(defer_hits), 0,
+                         "Comment with 'for' should not trigger")
+
+
+# ── DB exact_name match ─────────────────────────────────────────
+
+
+class TestExactNameMatch(unittest.TestCase):
+    """find_symbols(exact_name=True) should not do substring match."""
+
+    def test_exact_match_no_substring(self):
+        from boundary_mapper.db import FactStore
+        store = FactStore(":memory:")
+        from boundary_mapper.models import SymbolNode, SymbolKind, Side
+        store.upsert_symbol(SymbolNode(
+            name="TQUIC_SEND",
+            kind=SymbolKind.ENUM_VALUE,
+            side=Side.KERNEL,
+        ))
+        store.upsert_symbol(SymbolNode(
+            name="TQUIC_SENDMSG",
+            kind=SymbolKind.ENUM_VALUE,
+            side=Side.KERNEL,
+        ))
+
+        # Exact match should return only TQUIC_SEND
+        exact = store.find_symbols(
+            name="TQUIC_SEND", kind="enum_value", exact_name=True)
+        self.assertEqual(len(exact), 1)
+        self.assertEqual(exact[0].name, "TQUIC_SEND")
+
+        # LIKE match should return both
+        like = store.find_symbols(
+            name="TQUIC_SEND", kind="enum_value")
+        self.assertEqual(len(like), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

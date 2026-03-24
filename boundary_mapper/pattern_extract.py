@@ -1055,6 +1055,24 @@ class PatternExtractor:
             return True
         return False
 
+    # Lint categories that should be skipped in test files.
+    # Test code has different idioms (unchecked errors, test constants,
+    # hardcoded values) that are not security issues.
+    _TEST_SKIP_CATEGORIES = {
+        "unchecked_alloc", "unsafe_copy", "use_after_free",
+        "deadlock", "integer_overflow", "buffer_overflow",
+        "hardcoded_value", "unchecked_error", "unsafe_panic",
+        "resource_leak",
+    }
+
+    def _is_test_file(self, rel_path: str) -> bool:
+        """Check if a file is a test file."""
+        return (rel_path.endswith("_test.go") or
+                rel_path.endswith("_test.c") or
+                "/test/" in rel_path or
+                "/tests/" in rel_path or
+                "/testing/" in rel_path)
+
     def _extract_lint(self, content: str, sf, result, lang, ext: str):
         """Run lint patterns against file content and collect hits.
 
@@ -1065,12 +1083,17 @@ class PatternExtractor:
         3. Pattern-specific false positive checks (UAF, deadlock)
 
         Multiline patterns run per-function to avoid cross-function matches.
+        Test files (_test.go, _test.c, test/) skip security-focused lint.
         """
+        is_test = self._is_test_file(sf.rel_path)
         lines = content.split("\n")
         func_chunks = None  # lazy-split only if needed
 
         for lp in lang.lint_patterns:
             if lp.only_in and ext != lp.only_in:
+                continue
+            # Skip security-focused lint in test files
+            if is_test and lp.category in self._TEST_SKIP_CATEGORIES:
                 continue
             try:
                 flags = re.MULTILINE
@@ -1146,6 +1169,16 @@ class PatternExtractor:
                 if lp.name == "user_size_to_kmalloc":
                     severity = self._assess_kmalloc_severity(
                         m, content, lp.severity)
+                elif lp.name == "hardcoded_ip":
+                    # Downgrade well-known IPs to INFO — loopback,
+                    # bind-all, broadcast, and link-local are almost
+                    # always intentional.
+                    ip_text = m.group(0).strip("\"'")
+                    if ip_text in ("127.0.0.1", "0.0.0.0", "255.255.255.255",
+                                   "::1", "::0", "169.254.0.0"):
+                        severity = "info"
+                elif lp.name == "hardcoded_port":
+                    severity = "info"  # well-known ports are informational
 
                 result.lint_hits.append({
                     "name": lp.name,

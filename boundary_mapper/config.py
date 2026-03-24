@@ -226,12 +226,24 @@ def _auto_discover(repo_root: Path, module_name: str,
                                     os.path.join(dirpath, fname),
                                     str(repo_root))))
 
+    # Suffixes that indicate a constant is a size/limit/flag, not a sockopt
+    _NON_SOCKOPT_SUFFIXES = [
+        "_MAX", "_MIN", "_LEN", "_SIZE", "_LIMIT", "_OVERHEAD",
+        "_BLOCK", "_DEFAULT", "_FACTOR", "_TIMEOUT", "_SEC",
+        "_VER", "_VERSION", "_GRP", "_MODE_", "_ERROR",
+        "_MAX_LEN", "_MIN_LEN", "_BUF_SIZE",
+    ]
+
+    # Collect ALL #define candidates first (validated against dispatch later)
+    all_defines = {}  # name → val_str
+
     for hpath in header_files[:200]:  # cap for speed
         try:
             with open(hpath, "r", errors="replace") as f:
                 content = f.read()
         except OSError:
             continue
+
         for m in define_re.finditer(content):
             name = m.group(1)
             val = m.group(2)
@@ -240,11 +252,48 @@ def _auto_discover(repo_root: Path, module_name: str,
             if len(parts) >= 2:
                 pfx = "_".join(parts[:2]) + "_"
                 prefix_counter[pfx] += 1
-            # Detect sockopt-like constants (prefix matches module, numeric val)
+
+            # Collect sockopt candidates: prefix match + numeric 1-999
             if name.startswith(prefix) and val.isdigit():
                 num = int(val)
                 if 0 < num < 1000:
-                    sockopt_map[str(num)] = name
+                    all_defines[name] = str(num)
+
+    # ── Phase 2b: Scan kernel .c files for actual sockopt dispatch cases ──
+    dispatched = set()
+    case_re = re.compile(r'case\s+(\w+)\s*:', re.MULTILINE)
+    for cpath, crel in c_files[:200]:
+        try:
+            with open(cpath, "r", errors="replace") as f:
+                c_content = f.read()
+        except OSError:
+            continue
+        for cm in case_re.finditer(c_content):
+            dispatched.add(cm.group(1))
+
+    # Build sockopt_map: prefer dispatched constants, filter out
+    # obvious non-sockopt names, handle numeric collisions
+    sockopt_map = {}
+    for name, val in all_defines.items():
+        # Skip constants whose names suggest sizes, limits, or flags
+        if any(name.endswith(suffix) or suffix + "_" in name
+               for suffix in _NON_SOCKOPT_SUFFIXES):
+            continue
+
+        # Handle numeric value collisions
+        if val in sockopt_map:
+            existing = sockopt_map[val]
+            # Prefer whichever is actually dispatched
+            if name in dispatched and existing not in dispatched:
+                sockopt_map[val] = name
+            elif existing in dispatched:
+                pass  # keep existing
+            else:
+                # Neither dispatched — prefer shorter name
+                if len(name) < len(existing):
+                    sockopt_map[val] = name
+        else:
+            sockopt_map[val] = name
 
     for cpath, crel in c_files[:200]:
         try:

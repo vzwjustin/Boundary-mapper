@@ -851,6 +851,18 @@ class DeadFunctionRule(Rule):
             if prefix:
                 relevant_dirs.add(prefix)
 
+        # Collect exported function names for dead function suppression
+        exported = {s.properties.get("target", "")
+                    for s in store.find_symbols(
+                        name="__export__", kind="registration", limit=5000)}
+
+        # Callback suffixes: functions likely wired through indirect mechanisms
+        _callback_suffixes = (
+            "_cb", "_callback", "_handler", "_fn", "_func",
+            "_notify", "_event", "_hook", "_ops", "_work",
+            "_timer", "_softirq", "_tasklet",
+        )
+
         all_funcs = store.find_symbols(kind="function_def", side="kernel",
                                        limit=20000)
         for fn in all_funcs:
@@ -868,6 +880,22 @@ class DeadFunctionRule(Rule):
             if fn.file_path.endswith(".h"):
                 continue
             if fn.name.startswith("__"):
+                continue
+            # (ops table handlers already in structurally_referenced above)
+            # Skip functions whose names match common callback patterns
+            if any(fn.name.endswith(s) for s in _callback_suffixes):
+                continue
+            # Skip static functions — may be called via pointer within file
+            if fn.properties.get("storage_class") == "static":
+                continue
+            # Skip __init and __exit functions — wired via module macros
+            if fn.properties.get("section") in ("__init", "__exit"):
+                continue
+            if any("__init" in ev.snippet or "__exit" in ev.snippet
+                   for ev in fn.evidence if ev.snippet):
+                continue
+            # Skip exported functions
+            if fn.name in exported:
                 continue
 
             findings.append(Finding(

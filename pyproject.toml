@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "boundary-mapper"
+version = "1.0.0"
+description = "Universal kernel↔userspace boundary reachability and wiring verification"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+clang = ["libclang>=14.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+boundary-mapper = "boundary_mapper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["boundary_mapper/tests"]

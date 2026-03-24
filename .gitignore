@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+*.egg-info/
+.boundary_mapper.db*
+boundary_reports/
+dist/
+build/
+*.DS_Store

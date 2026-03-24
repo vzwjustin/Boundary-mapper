@@ -477,14 +477,31 @@ class GraphBuilder:
                 return candidates[0].name
         return None
 
-    def _find_userspace_producer(self, cmd_name: str) -> Optional[str]:
-        """Find userspace code that produces this command."""
-        # Search for Go constants referencing this command
+    def _find_userspace_producer(self, cmd_name: str,
+                                  sockopt_num: str = "") -> Optional[str]:
+        """Find userspace code that produces this command.
+
+        Searches for:
+        1. Exact name match in userspace symbols (Go/C constants)
+        2. Name as a substring reference in userspace files
+        3. Dispatch entries from Go setsockopt/getsockopt boundary patterns
+        """
+        # Method 1: Exact name match in userspace symbols
         candidates = self.store.find_symbols(
             name=cmd_name, side="userspace",
         )
         if candidates:
             return f"{candidates[0].file_path}:{candidates[0].line_start}"
+
+        # Method 2: Check if the name appears in any dispatch entries
+        # (catches Go setsockopt boundary patterns)
+        dispatch_syms = self.store.find_symbols(
+            name=cmd_name, kind="enum_value",
+        )
+        for sym in dispatch_syms:
+            if sym.side == Side.USERSPACE:
+                return f"{sym.file_path}:{sym.line_start}"
+
         return None
 
     def _build_sockopt_surfaces(self):
@@ -493,16 +510,25 @@ class GraphBuilder:
             return
 
         for opt_num, opt_name in self.profile.SOCKOPT_MAP.items():
-            # Check if case handler exists
+            # Check if this option has a case statement in any dispatch
+            # function (stronger than just finding the enum_value symbol)
             handler_syms = self.store.find_symbols(
                 name=opt_name, kind="enum_value",
             )
-            # Find dispatch case
-            has_set_handler = bool(handler_syms)
+            dispatch_entries = [
+                s for s in handler_syms
+                if s.properties.get("dispatch")
+            ]
+            has_set_handler = bool(handler_syms) or bool(dispatch_entries)
 
-            # Check getsockopt too
+            # Check for userspace producer
+            us_producer = self._find_userspace_producer(
+                opt_name, sockopt_num=str(opt_num))
+
             status = WiringStatus.DECLARED
-            if has_set_handler:
+            if has_set_handler and us_producer:
+                status = WiringStatus.STATICALLY_REACHABLE
+            elif has_set_handler:
                 status = WiringStatus.DISPATCH_LINKED
 
             surf = BoundarySurface(
@@ -510,6 +536,7 @@ class GraphBuilder:
                 name=f"sockopt:{opt_name}",
                 description=f"Socket option {opt_name} (opt={opt_num})",
                 kernel_entrypoint="",
+                userspace_producer=us_producer or "",
                 shared_contract=opt_name,
                 dispatch_key=str(opt_num),
                 status=status,

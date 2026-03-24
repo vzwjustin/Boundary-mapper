@@ -226,11 +226,16 @@ def _auto_discover(repo_root: Path, module_name: str,
                                     os.path.join(dirpath, fname),
                                     str(repo_root))))
 
-    # Sockopt-related keywords: constants with these substrings are likely
-    # actual socket options rather than arbitrary numeric #defines.
-    _SOCKOPT_KEYWORDS = {"OPT", "SOL", "SO_", "SOCKOPT", "SETSOCKOPT",
-                         "GETSOCKOPT", "TCP_", "UDP_", "IP_", "IPV6_",
-                         "SCTP_", "DCCP_", "MPTCP_"}
+    # Suffixes that indicate a constant is a size/limit/flag, not a sockopt
+    _NON_SOCKOPT_SUFFIXES = [
+        "_MAX", "_MIN", "_LEN", "_SIZE", "_LIMIT", "_OVERHEAD",
+        "_BLOCK", "_DEFAULT", "_FACTOR", "_TIMEOUT", "_SEC",
+        "_VER", "_VERSION", "_GRP", "_MODE_", "_ERROR",
+        "_MAX_LEN", "_MIN_LEN", "_BUF_SIZE",
+    ]
+
+    # Collect ALL #define candidates first (validated against dispatch later)
+    all_defines = {}  # name → val_str
 
     for hpath in header_files[:200]:  # cap for speed
         try:
@@ -238,11 +243,6 @@ def _auto_discover(repo_root: Path, module_name: str,
                 content = f.read()
         except OSError:
             continue
-
-        # Determine if this header is in a UAPI / shared directory
-        hrel = os.path.relpath(hpath, str(repo_root)).lower()
-        is_uapi = any(k in hrel for k in ("uapi", "shared", "public",
-                                           "include/net", "include/linux"))
 
         for m in define_re.finditer(content):
             name = m.group(1)
@@ -253,23 +253,47 @@ def _auto_discover(repo_root: Path, module_name: str,
                 pfx = "_".join(parts[:2]) + "_"
                 prefix_counter[pfx] += 1
 
-            # Detect sockopt-like constants — stricter heuristic:
-            # Must match module prefix AND be a plausible sockopt:
-            #   - Located in a UAPI/shared header, OR
-            #   - Name contains a sockopt keyword (OPT, SOL, SO_, etc.), OR
-            #   - File also contains setsockopt/getsockopt references
+            # Collect sockopt candidates: prefix match + numeric 1-999
             if name.startswith(prefix) and val.isdigit():
                 num = int(val)
                 if 0 < num < 1000:
-                    name_upper = name.upper()
-                    has_sockopt_keyword = any(kw in name_upper
-                                              for kw in _SOCKOPT_KEYWORDS)
-                    file_has_sockopt_ctx = ("setsockopt" in content or
-                                            "getsockopt" in content or
-                                            "sol_" in content.lower() or
-                                            "sockopt" in content.lower())
-                    if is_uapi or has_sockopt_keyword or file_has_sockopt_ctx:
-                        sockopt_map[str(num)] = name
+                    all_defines[name] = str(num)
+
+    # ── Phase 2b: Scan kernel .c files for actual sockopt dispatch cases ──
+    dispatched = set()
+    case_re = re.compile(r'case\s+(\w+)\s*:', re.MULTILINE)
+    for cpath, crel in c_files[:200]:
+        try:
+            with open(cpath, "r", errors="replace") as f:
+                c_content = f.read()
+        except OSError:
+            continue
+        for cm in case_re.finditer(c_content):
+            dispatched.add(cm.group(1))
+
+    # Build sockopt_map: prefer dispatched constants, filter out
+    # obvious non-sockopt names, handle numeric collisions
+    sockopt_map = {}
+    for name, val in all_defines.items():
+        # Skip constants whose names suggest sizes, limits, or flags
+        if any(name.endswith(suffix) or suffix + "_" in name
+               for suffix in _NON_SOCKOPT_SUFFIXES):
+            continue
+
+        # Handle numeric value collisions
+        if val in sockopt_map:
+            existing = sockopt_map[val]
+            # Prefer whichever is actually dispatched
+            if name in dispatched and existing not in dispatched:
+                sockopt_map[val] = name
+            elif existing in dispatched:
+                pass  # keep existing
+            else:
+                # Neither dispatched — prefer shorter name
+                if len(name) < len(existing):
+                    sockopt_map[val] = name
+        else:
+            sockopt_map[val] = name
 
     for cpath, crel in c_files[:200]:
         try:

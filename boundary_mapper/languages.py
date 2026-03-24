@@ -55,6 +55,11 @@ class LintPattern:
     recommendation: str = ""           # suggested fix
     multiline: bool = False            # whether to use re.DOTALL
     only_in: str = ""                 # restrict to specific extensions
+    confidence: str = "medium"         # "high", "medium", "low"
+    suppress_if: str = ""              # regex to check in next ~300 chars;
+                                       # if it matches, suppress the finding.
+                                       # Use \\1, \\2, etc. to reference capture
+                                       # groups from the main match.
 
 
 @dataclass
@@ -223,6 +228,8 @@ LANG_C = LanguageDef(
             message="Allocation result not checked for NULL on same line",
             recommendation="add_null_check",
             only_in="c",
+            confidence="low",
+            suppress_if=r'if\s*\(\s*(?:!\\1|\\1\s*==\s*NULL|unlikely\s*\(\s*!\\1|IS_ERR(?:_OR_NULL)?\s*\(\s*\\1)',
         ),
         LintPattern(
             name="unchecked_alloc_skb",
@@ -232,6 +239,8 @@ LANG_C = LanguageDef(
             message="SKB allocation result may not be NULL-checked",
             recommendation="add_null_check",
             only_in="c",
+            confidence="low",
+            suppress_if=r'if\s*\(\s*(?:!\\1|\\1\s*==\s*NULL|unlikely\s*\(\s*!\\1|IS_ERR(?:_OR_NULL)?\s*\(\s*\\1)',
         ),
         LintPattern(
             name="unchecked_kstrdup",
@@ -241,6 +250,8 @@ LANG_C = LanguageDef(
             message="String/memory dup result may not be NULL-checked",
             recommendation="add_null_check",
             only_in="c",
+            confidence="low",
+            suppress_if=r'if\s*\(\s*(?:!\\1|\\1\s*==\s*NULL|unlikely\s*\(\s*!\\1|IS_ERR(?:_OR_NULL)?\s*\(\s*\\1)',
         ),
         LintPattern(
             name="use_after_free_pattern",
@@ -251,6 +262,7 @@ LANG_C = LanguageDef(
             recommendation="set_pointer_null_after_free",
             multiline=True,
             only_in="c",
+            confidence="low",
         ),
         # ── Error handling ──
         LintPattern(
@@ -265,13 +277,14 @@ LANG_C = LanguageDef(
         # ── Lock safety ──
         LintPattern(
             name="double_lock_pattern",
-            regex=r'(spin_lock(?:_bh|_irq|_irqsave)?)\s*\([^)]+\).*\1\s*\(',
+            regex=r'(spin_lock(?:_bh|_irq|_irqsave)?)\s*\(\s*(&[\w>.\-]+)\s*\)[^}]*\1\s*\(\s*\2\s*\)',
             severity="high",
             category="deadlock",
-            message="Same lock type acquired twice — potential deadlock",
+            message="Same lock acquired twice — potential deadlock",
             recommendation="check_lock_ordering",
             multiline=True,
             only_in="c",
+            confidence="medium",
         ),
         # ── API misuse ──
         LintPattern(
@@ -440,8 +453,34 @@ LANG_GO = LanguageDef(
             kind=SymbolKind.GO_CONST,
             confidence=Confidence.MEDIUM,
         ),
+        SymbolPattern(
+            name="go_const_def",
+            regex=r'(?:const\s+)?(\w+)\s*=\s*(\d+)\s*(?://.*)?$',
+            kind=SymbolKind.CONSTANT,
+            group=1,
+            confidence=Confidence.MEDIUM,
+        ),
     ],
-    boundary_patterns=[],
+    boundary_patterns=[
+        BoundaryPattern(
+            name="go_setsockopt",
+            regex=r'(?:SetsockoptInt|SetSockOptInt|setIntOpt|setSockOpt|SetsockoptString)\s*\([^,]+,\s*\w+,\s*(\w+)',
+            extract_type="dispatch",
+            groups={"case": 1},
+        ),
+        BoundaryPattern(
+            name="go_getsockopt",
+            regex=r'(?:GetsockoptInt|GetSockOptInt|getIntOpt|getSockOpt|GetsockoptString)\s*\([^,]+,\s*\w+,\s*(\w+)',
+            extract_type="dispatch",
+            groups={"case": 1},
+        ),
+        BoundaryPattern(
+            name="c_setsockopt_call",
+            regex=r'setsockopt\s*\([^,]+,\s*\w+,\s*(\w+)',
+            extract_type="dispatch",
+            groups={"case": 1},
+        ),
+    ],
     lint_patterns=[
         # ── Error handling ──
         LintPattern(

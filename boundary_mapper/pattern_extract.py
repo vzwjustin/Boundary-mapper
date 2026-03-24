@@ -726,14 +726,120 @@ class PatternExtractor:
 
         return False
 
+    # Regex to find top-level C function boundaries for scoped lint
+    _RE_FUNC_BOUNDARY = re.compile(
+        r'^[a-zA-Z_][\w\s*]+\w+\s*\([^)]*\)\s*\{',
+        re.MULTILINE,
+    )
+
+    def _split_functions(self, content: str) -> list[tuple[int, str]]:
+        """Split C source into (start_line, function_body) chunks.
+
+        Each chunk starts at a top-level `{` following a function
+        signature and ends at the matching `}`.
+        """
+        chunks = []
+        for m in self._RE_FUNC_BOUNDARY.finditer(content):
+            start = m.start()
+            brace_pos = content.index('{', m.start())
+            depth = 0
+            i = brace_pos
+            while i < len(content):
+                if content[i] == '{':
+                    depth += 1
+                elif content[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        line = content[:start].count('\n') + 1
+                        chunks.append((line, content[start:i + 1]))
+                        break
+                i += 1
+        return chunks
+
+    def _check_suppress_if(self, lp, m, content: str) -> bool:
+        """Check the LintPattern.suppress_if regex against lookahead text."""
+        if not lp.suppress_if:
+            return False
+        suppress_re = lp.suppress_if
+        # Replace backrefs \\1, \\2, etc. with actual captured groups
+        # (suppress_if uses raw strings, so \\1 is two chars: backslash + "1")
+        for i in range(1, 10):
+            try:
+                suppress_re = suppress_re.replace(
+                    '\\\\' + str(i), re.escape(m.group(i)))
+            except IndexError:
+                break
+        lookahead = content[m.end():m.end() + 300]
+        try:
+            if re.search(suppress_re, lookahead):
+                return True
+        except re.error:
+            pass
+        return False
+
+    def _check_uaf_false_positive(self, m, content: str) -> bool:
+        """Check if a use-after-free match is a false positive.
+
+        Suppresses if the next use of the variable after kfree is:
+        - A reassignment (ptr = ...)
+        - NULLing a struct field (conn->field = NULL)
+        - Only in a log macro
+        """
+        try:
+            var_name = m.group(1)
+        except (IndexError, AttributeError):
+            return False
+
+        after_free = content[m.start():m.end()]
+        kfree_end_pos = after_free.find(";")
+        if kfree_end_pos < 0:
+            return False
+        rest = after_free[kfree_end_pos + 1:]
+
+        # Suppress if the next use is an assignment TO the variable
+        if re.search(rf'^\s*{re.escape(var_name)}\s*=\s', rest, re.MULTILINE):
+            return True
+        # Suppress if the next use is NULLing a struct field
+        if re.search(r'\w+->\w+\s*=\s*NULL\s*;', rest):
+            return True
+        # Suppress if var only appears in a log/print macro
+        if re.search(
+            rf'(?:pr_\w+|dev_\w+|printk|net_\w+)\s*\(.*\b{re.escape(var_name)}\b',
+            rest, re.DOTALL,
+        ):
+            return True
+        return False
+
+    def _check_deadlock_false_positive(self, m) -> bool:
+        """Check if a double-lock match has an unlock in between."""
+        try:
+            lock_call = m.group(1)
+            lock_arg = m.group(2)
+        except (IndexError, AttributeError):
+            return False
+
+        between = m.group(0)
+        unlock_name = lock_call.replace("lock", "unlock")
+        # Check for unlock with same lock argument between acquisitions
+        if f"{unlock_name}({lock_arg})" in between or \
+           f"{unlock_name}( {lock_arg}" in between:
+            return True
+        return False
+
     def _extract_lint(self, content: str, sf, result, lang, ext: str):
         """Run lint patterns against file content and collect hits.
 
-        For each match, checks the surrounding 1-3 lines for standard
-        guards (NULL checks, error checks, unlocks, size validation).
-        Matches with proper guards are suppressed to reduce false positives.
+        For each match, checks:
+        1. suppress_if regex on the LintPattern (lookahead-based)
+        2. Surrounding lines for standard guards (NULL checks, error
+           checks, unlocks, size validation)
+        3. Pattern-specific false positive checks (UAF, deadlock)
+
+        Multiline patterns run per-function to avoid cross-function matches.
         """
         lines = content.split("\n")
+        func_chunks = None  # lazy-split only if needed
+
         for lp in lang.lint_patterns:
             if lp.only_in and ext != lp.only_in:
                 continue
@@ -745,13 +851,74 @@ class PatternExtractor:
             except re.error:
                 continue
 
+            # For multiline patterns, run per-function to avoid
+            # cross-function false positives
+            if lp.multiline and ext in ("c", "h"):
+                if func_chunks is None:
+                    func_chunks = self._split_functions(content)
+                for func_line, func_body in func_chunks:
+                    for m in pat.finditer(func_body):
+                        line = func_line + func_body[:m.start()].count("\n")
+
+                        # suppress_if check
+                        if self._check_suppress_if(lp, m, func_body):
+                            continue
+
+                        # Pattern-specific false positive checks
+                        if lp.name == "use_after_free_pattern":
+                            if self._check_uaf_false_positive(m, func_body):
+                                continue
+                        if lp.name == "double_lock_pattern":
+                            if self._check_deadlock_false_positive(m):
+                                continue
+
+                        # Standard guard check
+                        func_lines = func_body.split("\n")
+                        local_line = func_body[:m.start()].count("\n")
+                        if self._has_guard_in_context(
+                                func_body, m, lp.category,
+                                func_lines, local_line):
+                            continue
+
+                        snippet = m.group(0)[:120].strip()
+                        result.lint_hits.append({
+                            "name": lp.name,
+                            "severity": lp.severity,
+                            "category": lp.category,
+                            "message": lp.message,
+                            "recommendation": lp.recommendation,
+                            "file": sf.rel_path,
+                            "line": line,
+                            "snippet": snippet,
+                        })
+                continue  # skip whole-file finditer for multiline patterns
+
             for m in pat.finditer(content):
                 line = content[:m.start()].count("\n") + 1
 
-                # Check if a standard guard exists in the surrounding context
+                # suppress_if check (generic, declared on the LintPattern)
+                if self._check_suppress_if(lp, m, content):
+                    continue
+
+                # Standard guard check
                 if self._has_guard_in_context(content, m, lp.category,
                                                lines, line - 1):
-                    continue  # guarded — not a true positive
+                    continue
+
+                # Pattern-specific checks for user_size_to_kmalloc
+                if lp.name == "user_size_to_kmalloc":
+                    size_match = re.search(r'kmalloc\s*\(\s*(\w+)', m.group(0))
+                    if size_match:
+                        var = size_match.group(1)
+                        lookbehind = content[max(0, m.start() - 500):m.start()]
+                        bounds_patterns = [
+                            rf'if\s*\(\s*{re.escape(var)}\s*[>!]',
+                            rf'if\s*\([^)]*{re.escape(var)}\s*>',
+                            rf'min\s*\(\s*{re.escape(var)}',
+                            rf'{re.escape(var)}\s*=\s*min',
+                        ]
+                        if any(re.search(p, lookbehind) for p in bounds_patterns):
+                            continue
 
                 snippet = m.group(0)[:120].strip()
                 result.lint_hits.append({

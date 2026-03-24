@@ -693,6 +693,250 @@ def _show_full_context(fwd, rev, func, func_info, func_decls, depth):
         print()
 
 
+def cmd_diagnose(args):
+    """Full health check on a function — everything the tool knows in one place."""
+    from collections import defaultdict
+    store = load_store(args)
+
+    func = args.function
+
+    # ── Build indexes ──
+    func_info = {}
+    for sym in store.find_symbols(kind="function_def", limit=50000):
+        func_info[sym.name] = {
+            "file": sym.file_path, "line": sym.line_start,
+            "body_lines": sym.properties.get("body_lines", 0),
+            "body_status": sym.properties.get("body_status", "unknown"),
+            "has_todo": sym.properties.get("has_todo", False),
+            "signature": sym.properties.get("signature", ""),
+        }
+    func_decls = defaultdict(list)
+    for sym in store.find_symbols(kind="function_decl", limit=20000):
+        sig = sym.properties.get("signature", "")
+        if sig:
+            func_decls[sym.name].append({
+                "file": sym.file_path, "line": sym.line_start, "sig": sig,
+            })
+
+    call_edges = store.get_edges(kind="calls", limit=200000)
+    fwd = defaultdict(list)
+    rev = defaultdict(list)
+    for edge in call_edges:
+        caller = edge.properties.get("caller", "")
+        callee = edge.properties.get("callee", "")
+        if caller and callee:
+            ev = edge.evidence[0] if edge.evidence else None
+            fp = ev.file_path if ev else "?"
+            ln = ev.line_start if ev else 0
+            fwd[caller].append((callee, fp, ln))
+            rev[callee].append((caller, fp, ln))
+
+    # Fuzzy match
+    all_names = set(func_info.keys()) | set(fwd.keys()) | set(rev.keys())
+    if func not in all_names:
+        matches = [n for n in all_names if func.lower() in n.lower()]
+        if len(matches) == 1:
+            func = matches[0]
+        elif matches:
+            print(f"Multiple matches for '{func}':")
+            for m in sorted(matches)[:15]:
+                print(f"  {m}  {_status_tag(func_info.get(m, {}))}")
+            store.close()
+            return
+        else:
+            print(f"'{func}' not found.")
+            store.close()
+            return
+
+    info = func_info.get(func, {})
+    tag = _status_tag(info)
+    loc = _func_location(info)
+    callers = rev.get(func, [])
+    callees = fwd.get(func, [])
+
+    # ══════════════════════════════════════════════
+    print(f"\n{'═'*60}")
+    print(f"  DIAGNOSE: {func}()")
+    print(f"{'═'*60}")
+    print(f"  {loc}  {tag}")
+    if info.get("signature"):
+        print(f"  signature: {info['signature']}")
+    print()
+
+    issues = []
+    warnings = []
+    good = []
+
+    # ── 1. Does it exist? ──
+    if not info:
+        issues.append("MISSING — no function definition found")
+        print(f"  ❌ MISSING: no definition found in the scanned codebase")
+        print()
+        store.close()
+        return
+    elif info["body_status"] == "empty":
+        issues.append(f"EMPTY body — needs implementation")
+    elif info["body_status"] == "stub_todo":
+        issues.append(f"STUB with TODO — needs implementation ({info['body_lines']}L)")
+    elif info["body_status"] == "stub_return":
+        warnings.append(f"Return-only stub — may need real implementation")
+    elif info["body_status"] == "live_todo":
+        warnings.append(f"Has TODO/FIXME markers")
+    else:
+        good.append(f"Live implementation ({info['body_lines']} lines)")
+
+    # ── 2. Signature mismatches ──
+    decls = func_decls.get(func, [])
+    if decls and info.get("signature"):
+        for d in decls:
+            if d["sig"] != info["signature"]:
+                issues.append(
+                    f"SIGNATURE MISMATCH: def has {info['signature']} "
+                    f"but {d['file']}:{d['line']} declares {d['sig']}")
+    if decls and info.get("signature"):
+        matching = [d for d in decls if d["sig"] == info["signature"]]
+        if matching:
+            good.append(f"Signature consistent across {len(matching) + 1} files")
+
+    # ── 3. Is it reachable? ──
+    init_regs = store.find_symbols(name="__module_init__",
+                                   kind="registration", limit=50)
+    init_targets = {s.properties.get("target", "") for s in init_regs}
+    if init_targets:
+        # BFS from init
+        reachable_from_init = set()
+        stack = list(init_targets)
+        while stack and len(reachable_from_init) < 5000:
+            fn = stack.pop()
+            if fn in reachable_from_init:
+                continue
+            reachable_from_init.add(fn)
+            for callee, _, _ in fwd.get(fn, []):
+                if callee not in reachable_from_init:
+                    stack.append(callee)
+
+        if func in reachable_from_init:
+            good.append("Reachable from module_init")
+        else:
+            if callers:
+                warnings.append("NOT reachable from module_init (runtime-only path)")
+            else:
+                issues.append("NOT reachable from module_init AND has no callers")
+
+    # ── 4. Callers ──
+    if not callers:
+        # Check if it's in an ops table or exported
+        in_ops = False
+        all_impl = store.get_edges(kind="implements", limit=20000)
+        for edge in all_impl:
+            if edge.properties.get("handler") == func:
+                in_ops = True
+                break
+        exports = store.find_symbols(name=f"__export__{func}",
+                                     kind="registration", limit=1)
+        if in_ops:
+            good.append("Wired via ops table (indirect callers)")
+        elif exports:
+            good.append("Exported symbol (called externally)")
+        else:
+            issues.append("ZERO callers — no function calls this, not in ops table, not exported")
+    else:
+        good.append(f"{len(callers)} callers")
+
+    # ── 5. Callees health ──
+    stub_callees = []
+    missing_callees = []
+    for callee, fp, ln in callees:
+        ci = func_info.get(callee, {})
+        s = ci.get("body_status", "missing")
+        if s in ("stub_todo", "stub_return", "empty"):
+            stub_callees.append(callee)
+        elif not ci:
+            missing_callees.append(callee)
+    if stub_callees:
+        warnings.append(f"{len(stub_callees)} callees are stubs: {', '.join(stub_callees[:5])}")
+    if missing_callees:
+        # Filter out likely kernel builtins
+        real_missing = [m for m in missing_callees
+                       if not m[0].islower() or len(m) > 15]
+        if real_missing:
+            warnings.append(f"{len(real_missing)} callees not found: {', '.join(real_missing[:5])}")
+    if callees and not stub_callees and not missing_callees:
+        good.append(f"All {len(callees)} callees are live")
+
+    # ── 6. Lint findings on this file ──
+    findings = store.get_findings(limit=50000)
+    file_path = info.get("file", "")
+    lint_here = [f for f in findings
+                 if f.evidence and f.evidence[0].file_path == file_path
+                 and abs(f.evidence[0].line_start - info.get("line", 0)) < info.get("body_lines", 50) + 5
+                 and f.category in (
+                     "unchecked_alloc", "use_after_free", "deadlock",
+                     "unsafe_copy", "buffer_overflow", "unsafe_panic",
+                     "integer_overflow",
+                 )]
+    if lint_here:
+        for f in lint_here[:5]:
+            issues.append(f"LINT [{f.category}]: {f.evidence[0].snippet[:60]}")
+
+    # ── 7. Consistency findings ──
+    consistency = [f for f in findings
+                   if func in f.title and f.category in (
+                       "signature_mismatch", "duplicate_definition",
+                   )]
+    for f in consistency:
+        issues.append(f"CONSISTENCY: {f.title}")
+
+    # ══════════════════════════════════════════════
+    # Print report
+    print(f"  {'─'*56}")
+
+    if issues:
+        print(f"\n  ❌ ISSUES ({len(issues)}):")
+        for i in issues:
+            print(f"    • {i}")
+
+    if warnings:
+        print(f"\n  ⚠️  WARNINGS ({len(warnings)}):")
+        for w in warnings:
+            print(f"    • {w}")
+
+    if good:
+        print(f"\n  ✅ HEALTHY ({len(good)}):")
+        for g in good:
+            print(f"    • {g}")
+
+    # ── Callers (brief) ──
+    if callers:
+        print(f"\n  CALLERS ({len(callers)}):")
+        for caller, fp, ln in sorted(callers, key=lambda x: x[0])[:8]:
+            ci = func_info.get(caller, {})
+            print(f"    ← {caller}()  {fp}:{ln}  {_status_tag(ci)}")
+        if len(callers) > 8:
+            print(f"    ... +{len(callers) - 8} more")
+
+    # ── Callees (brief) ──
+    if callees:
+        print(f"\n  CALLS ({len(callees)}):")
+        for callee, fp, ln in sorted(callees, key=lambda x: x[0])[:8]:
+            ci = func_info.get(callee, {})
+            print(f"    → {callee}()  {fp}:{ln}  {_status_tag(ci)}")
+        if len(callees) > 8:
+            print(f"    ... +{len(callees) - 8} more")
+
+    # ── Verdict ──
+    print(f"\n  {'─'*56}")
+    if issues:
+        print(f"  VERDICT: ❌ {len(issues)} issue(s) found — needs attention")
+    elif warnings:
+        print(f"  VERDICT: ⚠️  Functional but {len(warnings)} warning(s)")
+    else:
+        print(f"  VERDICT: ✅ HEALTHY — no issues detected")
+    print()
+
+    store.close()
+
+
 def cmd_show(args):
     """Show detail for a specific surface."""
     store = load_store(args)
@@ -895,6 +1139,19 @@ def main():
     p_trace.add_argument("--depth", type=int, default=2,
                          help="Depth for recursive caller/callee display (default: 2)")
 
+    # diagnose
+    p_diag = sub.add_parser("diagnose",
+        help="Full health check on a function",
+        description=(
+            "Run every check on a single function: reachability, signature\n"
+            "consistency, caller/callee health, lint, stubs, and more.\n\n"
+            "  boundary-mapper diagnose my_function\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_diag.add_argument("function",
+                        help="Function name (exact or partial match)")
+
     # stats
     sub.add_parser("stats",
         help="Show database statistics",
@@ -939,6 +1196,7 @@ def main():
         "show": cmd_show,
         "show-surface": cmd_show,
         "trace": cmd_trace,
+        "diagnose": cmd_diagnose,
         "stats": cmd_stats,
         "profiles": cmd_profiles,
         "languages": cmd_languages,
